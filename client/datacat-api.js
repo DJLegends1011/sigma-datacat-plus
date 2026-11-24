@@ -276,6 +276,12 @@ export async function loginDatacatAccount(email, password) {
     return dcHelperJson(`${DC_EXT_BASE}/dc-auth-login`, 'POST', { email, password });
 }
 
+// a pasted account token (Google sign-ins have no password) goes straight to the server half,
+// which verifies and keeps it; it is never stored on the page
+export async function connectDatacatAccountToken(accountToken) {
+    return dcHelperJson(`${DC_EXT_BASE}/dc-auth-set`, 'POST', { accountToken });
+}
+
 export async function validateDatacatAccount() {
     return dcHelperJson(`${DC_EXT_BASE}/dc-auth-status`);
 }

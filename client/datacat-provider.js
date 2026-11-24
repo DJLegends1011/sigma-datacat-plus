@@ -36,6 +36,7 @@ import {
     fetchExtractionStatus,
     restoreDatacatAccount,
     loginDatacatAccount,
+    connectDatacatAccountToken,
     validateDatacatAccount,
     logoutDatacatAccount,
     parseJanitoraiSession,
@@ -570,6 +571,14 @@ export async function datacatLoginAccount(email, password) {
     if (!pluginOk) return { ok: false, error: 'DataCat Plus server not available' };
     const result = await loginDatacatAccount(email, password);
     if (result?.ok) invalidateDatacatFolderCache();
+    return result;
+}
+
+export async function datacatConnectAccountToken(accountToken) {
+    const pluginOk = await checkDcPluginAvailable();
+    if (!pluginOk) return { ok: false, error: 'DataCat Plus server not available' };
+    const result = await connectDatacatAccountToken(accountToken);
+    if (result?.ok || result?.valid) invalidateDatacatFolderCache();
     return result;
 }
 
