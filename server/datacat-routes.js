@@ -1,14 +1,21 @@
 // =============================================================================
 // DataCat: token session + extraction + read-only API proxy
 // =============================================================================
+import { randomUUID } from 'node:crypto';
+import {
+    buildDataCatAccountIdentifyHeaders,
+    buildDataCatHeaders,
+    chooseDataCatToken,
+    isDataCatCharacterId,
+    isDataCatFolderId,
+    normalizeDcCredential,
+    normalizeDcFolderIdList,
+    normalizeOptionalDcCredential,
+    sanitizeDataCatUser,
+} from './datacat-utils.js';
 
 const DATACAT_BASE = 'https://datacat.run';
-
-let dcSessionToken = null;
-let dcDeviceToken = null;
-const dcAccountSessions = new Map();
-const DC_CLIENT_HEADER = 'x-cl-datacat-client';
-const DC_CLIENT_ID_MAX_LENGTH = 128;
+export const T_SESSIONS = 'x_datacat_plus_sessions';
 const DC_PROXY_REDIRECT_LIMIT = 3;
 
 function dcHeaders(token, options = {}) {
@@ -19,68 +26,122 @@ function dcHeaders(token, options = {}) {
     });
 }
 
-function getDcClientId(req) {
-    const rawHeader = req.get?.('X-CL-Datacat-Client') || req.headers?.[DC_CLIENT_HEADER];
-    const raw = rawHeader || req.body?.clientSessionId || req.body?.clientId || req.query?.clientSessionId || req.query?.clientId;
-    const value = Array.isArray(raw) ? raw[0] : raw;
-    return normalizeDcCredential(value, { maxLength: DC_CLIENT_ID_MAX_LENGTH });
+function getUserHandle(req) {
+    return String(req.userHandle || 'default');
 }
 
-function requireDcClientId(req, res) {
-    const clientId = getDcClientId(req);
-    if (!clientId) {
-        res.status(400).json({ error: 'DataCat client session id is required' });
-        return null;
+function readDcSession(req) {
+    const handle = getUserHandle(req);
+    const row = req.db.prepare(
+        `SELECT anon_token, device_token, account_token, user_json FROM ${T_SESSIONS} WHERE user_handle = ?`
+    ).get(handle);
+    if (!row) {
+        return { anonToken: null, deviceToken: null, accountToken: null, user: null };
     }
-    return clientId;
+    let user = null;
+    if (row.user_json) {
+        try {
+            user = JSON.parse(row.user_json);
+        } catch {
+            user = null;
+        }
+    }
+    return {
+        anonToken: row.anon_token || null,
+        deviceToken: row.device_token || null,
+        accountToken: row.account_token || null,
+        user,
+    };
 }
 
-function getDcAccountSession(req) {
-    const clientId = getDcClientId(req);
-    return clientId ? dcAccountSessions.get(clientId) || null : null;
+function writeDcSession(req, patch) {
+    const handle = getUserHandle(req);
+    const current = readDcSession(req);
+    const next = {
+        anonToken: 'anonToken' in patch ? (patch.anonToken || null) : current.anonToken,
+        deviceToken: 'deviceToken' in patch ? (patch.deviceToken || null) : current.deviceToken,
+        accountToken: 'accountToken' in patch ? (patch.accountToken || null) : current.accountToken,
+        user: 'user' in patch ? (patch.user || null) : current.user,
+    };
+    req.db.prepare(
+        `INSERT INTO ${T_SESSIONS} (user_handle, anon_token, device_token, account_token, user_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_handle) DO UPDATE SET
+             anon_token = excluded.anon_token,
+             device_token = excluded.device_token,
+             account_token = excluded.account_token,
+             user_json = excluded.user_json,
+             updated_at = excluded.updated_at`
+    ).run(
+        handle,
+        next.anonToken,
+        next.deviceToken,
+        next.accountToken,
+        next.user ? JSON.stringify(next.user) : null,
+        Date.now(),
+    );
+    return next;
 }
 
-function setDcAccountSession(clientId, token, user) {
-    dcAccountSessions.set(clientId, { token, user: user || null });
-}
-
-function clearDcAccountSession(req) {
-    const clientId = getDcClientId(req);
-    if (clientId) dcAccountSessions.delete(clientId);
-}
-
-function getDcActiveToken(req, { preferAccount = true } = {}) {
-    const account = getDcAccountSession(req);
+function getDcActiveToken(session, { preferAccount = true } = {}) {
     return chooseDataCatToken({
-        accountToken: account?.token,
-        anonymousToken: dcSessionToken,
+        accountToken: session.accountToken,
+        anonymousToken: session.anonToken,
         preferAccount,
     });
 }
 
 function requireDcAccount(req, res) {
-    const clientId = requireDcClientId(req, res);
-    if (!clientId) return null;
-
-    const session = dcAccountSessions.get(clientId);
-    if (!session?.token) {
+    const session = readDcSession(req);
+    if (!session.accountToken) {
         res.status(401).json({ error: 'No DataCat account session configured' });
         return null;
     }
-    return session;
+    return { token: session.accountToken, user: session.user, deviceToken: session.deviceToken };
 }
 
-async function readDcJson(response) {
-    try {
-        return await response.json();
-    } catch {
-        return null;
+async function readDcResponse(response) {
+    const rawText = await response.text().catch(() => '');
+    let data = null;
+    if (rawText) {
+        try {
+            data = JSON.parse(rawText);
+        } catch {
+            data = null;
+        }
     }
+    return { data, rawText };
 }
 
-async function testDcToken(token) {
+function extractHtmlTitle(html) {
+    if (typeof html !== 'string' || !html) return null;
+    const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (!match) return null;
+    const title = match[1].replace(/\s+/g, ' ').trim();
+    return title ? title.slice(0, 200) : null;
+}
+
+function formatDcError(response, data, rawText, fallbackLabel = 'DataCat request') {
+    const jsonMsg = data && typeof data === 'object'
+        ? (data.reason || data.error || data.message || null)
+        : null;
+    if (typeof jsonMsg === 'string' && jsonMsg.trim()) {
+        return jsonMsg.trim();
+    }
+    const title = extractHtmlTitle(rawText);
+    if (title) {
+        return `DataCat returned HTTP ${response.status}: ${title}`;
+    }
+    const snippet = typeof rawText === 'string' ? rawText.replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+    if (snippet) {
+        return `DataCat returned HTTP ${response.status}: ${snippet}`;
+    }
+    return `${fallbackLabel} failed with DataCat HTTP ${response.status}`;
+}
+
+async function testDcToken(token, deviceToken) {
     const response = await fetch(`${DATACAT_BASE}/api/characters/recent-public?limit=1&offset=0&summary=1&minTotalTokens=889`, {
-        headers: dcHeaders(token, { deviceToken: dcDeviceToken }),
+        headers: dcHeaders(token, { deviceToken }),
     });
     return response;
 }
@@ -99,10 +160,10 @@ const DC_ALLOWED_PATHS = [
 ];
 
 // Resolve a usable public session ID for the extraction endpoint.
-async function getPublicSessionId(token) {
+async function getPublicSessionId(token, deviceToken) {
     try {
         const resp = await fetch(`${DATACAT_BASE}/api/users`, {
-            headers: dcHeaders(token, { deviceToken: dcDeviceToken }),
+            headers: dcHeaders(token, { deviceToken }),
         });
         if (!resp.ok) return null;
         const data = await resp.json();
@@ -118,7 +179,7 @@ async function getPublicSessionId(token) {
     }
 }
 
-async function verifyDcAccountToken(token) {
+async function verifyDcAccountToken(token, deviceToken) {
     const value = normalizeDcCredential(token);
     if (!value) {
         return { valid: false, reason: 'missing token', user: null };
@@ -127,10 +188,10 @@ async function verifyDcAccountToken(token) {
     try {
         const response = await fetch(`${DATACAT_BASE}/api/auth/verify`, {
             method: 'POST',
-            headers: buildDataCatHeaders({ sessionToken: value, deviceToken: dcDeviceToken, json: true }),
+            headers: buildDataCatHeaders({ sessionToken: value, deviceToken, json: true }),
             body: JSON.stringify({ token: value }),
         });
-        const data = await readDcJson(response);
+        const { data, rawText } = await readDcResponse(response);
 
         if (response.ok && data?.success && data?.valid && data?.user) {
             return { valid: true, user: sanitizeDataCatUser(data.user) };
@@ -138,7 +199,7 @@ async function verifyDcAccountToken(token) {
 
         return {
             valid: false,
-            reason: data?.reason || data?.error || `HTTP ${response.status}`,
+            reason: formatDcError(response, data, rawText, 'DataCat auth verify'),
             user: null,
         };
     } catch (err) {
@@ -146,8 +207,8 @@ async function verifyDcAccountToken(token) {
     }
 }
 
-async function activateDcAccountSession(token) {
-    const headers = buildDataCatAccountIdentifyHeaders(token, dcDeviceToken);
+async function activateDcAccountSession(token, deviceToken) {
+    const headers = buildDataCatAccountIdentifyHeaders(token, deviceToken);
     if (!headers) {
         return { ok: false, reason: 'missing account token' };
     }
@@ -157,38 +218,59 @@ async function activateDcAccountSession(token) {
             method: 'POST',
             headers,
         });
-        const data = await readDcJson(response);
+        const { data, rawText } = await readDcResponse(response);
         if (response.ok) {
-            if (data?.deviceToken || data?.newDeviceToken) {
-                dcDeviceToken = data.deviceToken || data.newDeviceToken;
-            }
-            return { ok: true };
+            const nextDeviceToken = data?.deviceToken || data?.newDeviceToken || null;
+            return { ok: true, deviceToken: nextDeviceToken };
         }
         return {
             ok: false,
-            reason: data?.reason || data?.error || `HTTP ${response.status}`,
+            reason: formatDcError(response, data, rawText, 'DataCat identify'),
         };
     } catch (err) {
         return { ok: false, reason: err.message };
     }
 }
 
-function buildDcRedirectHeaders(url, token) {
-    if (url.protocol === 'https:' && url.hostname === 'datacat.run') {
-        return buildDataCatHeaders({ sessionToken: token, deviceToken: dcDeviceToken });
+function guardDcProxyTargetFallback(req, res) {
+    const rawSplat = req.params?.splat;
+    const splat = Array.isArray(rawSplat) ? rawSplat.join('/') : String(rawSplat || '');
+    const targetPath = '/' + splat.replace(/^\/+/, '');
+
+    let targetUrl;
+    try {
+        targetUrl = new URL(targetPath, DATACAT_BASE);
+        targetUrl.search = new URL(req.url, 'http://localhost').search;
+    } catch {
+        res.status(400).json({ error: 'Invalid DataCat proxy path' });
+        return null;
     }
-    return {
-        'User-Agent': DATACAT_BROWSER_UA,
-        'Accept': '*/*',
-    };
+
+    if (targetUrl.origin !== DATACAT_BASE) {
+        res.status(403).json({ error: 'Proxy target must be datacat.run' });
+        return null;
+    }
+
+    if (!DC_ALLOWED_PATHS.some(re => re.test(targetUrl.pathname))) {
+        console.warn(`[datacat-plus] DC proxy blocked: ${targetUrl.pathname}`);
+        res.status(403).json({ error: 'Proxy path not allowed' });
+        return null;
+    }
+    return targetUrl;
 }
 
-async function fetchDcProxyTarget(targetUrl, token) {
+async function fetchDcProxyTarget(targetUrl, token, deviceToken, ctx) {
+    const init = {
+        method: 'GET',
+        headers: buildDataCatHeaders({ sessionToken: token, deviceToken }),
+    };
+    if (ctx?.helpers?.sameHostFetch) {
+        return ctx.helpers.sameHostFetch(targetUrl, init, { maxRedirects: DC_PROXY_REDIRECT_LIMIT });
+    }
     let currentUrl = targetUrl;
     for (let redirects = 0; redirects <= DC_PROXY_REDIRECT_LIMIT; redirects++) {
         const response = await fetch(currentUrl.toString(), {
-            method: 'GET',
-            headers: buildDcRedirectHeaders(currentUrl, token),
+            ...init,
             redirect: 'manual',
         });
 
@@ -197,59 +279,62 @@ async function fetchDcProxyTarget(targetUrl, token) {
         if (!isRedirect || !location) return response;
 
         const nextUrl = new URL(location, currentUrl);
-        if (!['http:', 'https:'].includes(nextUrl.protocol)) {
-            throw new Error('Blocked unsupported DataCat redirect protocol');
+        if (nextUrl.origin !== DATACAT_BASE) {
+            throw new Error('Blocked off-origin DataCat redirect');
         }
         currentUrl = nextUrl;
     }
     throw new Error('Too many DataCat redirects');
 }
 
-function registerDataCatRoutes(router) {
+export function registerDataCatRoutes(router, ctx = null) {
     router.post('/dc-init', async (req, res) => {
         const { force } = req.body ?? {};
+        const session = readDcSession(req);
 
         // If we already have a token and not forcing refresh, verify it still works
-        if (dcSessionToken && !force) {
+        if (session.anonToken && !force) {
             try {
-                const check = await testDcToken(dcSessionToken);
+                const check = await testDcToken(session.anonToken, session.deviceToken);
                 if (check.ok) {
-                    const result = { ok: true, cached: true, token: dcSessionToken };
-                    if (dcDeviceToken) result.deviceToken = dcDeviceToken;
+                    const result = { ok: true, cached: true, token: true };
+                    if (session.deviceToken) result.deviceToken = session.deviceToken;
                     return res.json(result);
                 }
             } catch { /* fall through to create new */ }
-            dcSessionToken = null;
+            writeDcSession(req, { anonToken: null });
         }
 
         // Create anonymous session via the Liberator identify endpoint
-        const deviceToken = dcDeviceToken || randomUUID();
+        const deviceToken = session.deviceToken || randomUUID();
         try {
             const response = await fetch(`${DATACAT_BASE}/api/liberator/identify`, {
                 method: 'POST',
                 headers: buildDataCatHeaders({ deviceToken, json: true }),
                 body: JSON.stringify({ deviceToken }),
             });
+            const { data, rawText } = await readDcResponse(response);
 
             if (!response.ok) {
-                const text = await response.text();
-                console.warn(`[cl-helper] DC identify failed: HTTP ${response.status}`);
-                return res.json({ ok: false, reason: `identify returned ${response.status}: ${text.slice(0, 200)}` });
+                console.warn(`[datacat-plus] DC identify failed: HTTP ${response.status}`);
+                return res.json({ ok: false, reason: formatDcError(response, data, rawText, 'DataCat identify') });
             }
 
-            const data = await response.json();
             if (data?.success && data?.sessionToken) {
-                dcSessionToken = data.sessionToken;
-                dcDeviceToken = data.deviceToken || data.newDeviceToken || deviceToken;
-                console.log('[cl-helper] DC anonymous session initialized');
-                return res.json({ ok: true, token: dcSessionToken, deviceToken: dcDeviceToken });
+                const saved = writeDcSession(req, {
+                    anonToken: data.sessionToken,
+                    deviceToken: data.deviceToken || data.newDeviceToken || deviceToken,
+                });
+                console.log('[datacat-plus] DC anonymous session initialized');
+                // token: true, never the token itself: sessions stay server-side (the client only checks it is truthy)
+                return res.json({ ok: true, token: true, deviceToken: saved.deviceToken });
             }
 
-            console.warn('[cl-helper] DC identify returned unexpected shape:', JSON.stringify(data).slice(0, 300));
-            res.json({ ok: false, reason: 'identify response missing sessionToken' });
+            console.warn('[datacat-plus] DC identify returned unexpected shape:', JSON.stringify(data).slice(0, 300));
+            res.json({ ok: false, reason: 'DataCat identify response missing sessionToken' });
         } catch (err) {
-            console.error('[cl-helper] DC auto-init error:', err.message);
-            res.json({ ok: false, reason: err.message });
+            console.error('[datacat-plus] DC auto-init error:', err.message);
+            res.json({ ok: false, reason: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -262,67 +347,69 @@ function registerDataCatRoutes(router) {
         }
         const normalizedDeviceToken = normalizeOptionalDcCredential(deviceToken);
 
-        dcSessionToken = value;
-        if (normalizedDeviceToken) dcDeviceToken = normalizedDeviceToken;
-        console.log('[cl-helper] DC session token stored');
+        const patch = { anonToken: value };
+        if (normalizedDeviceToken) patch.deviceToken = normalizedDeviceToken;
+        const saved = writeDcSession(req, patch);
+        console.log('[datacat-plus] DC session token stored');
         const result = { ok: true };
-        if (dcDeviceToken) result.deviceToken = dcDeviceToken;
+        if (saved.deviceToken) result.deviceToken = saved.deviceToken;
         res.json(result);
     });
 
-    router.post('/dc-clear-token', (_req, res) => {
-        dcSessionToken = null;
-        console.log('[cl-helper] DC session token cleared');
+    router.post('/dc-clear-token', (req, res) => {
+        writeDcSession(req, { anonToken: null });
+        console.log('[datacat-plus] DC session token cleared');
         res.json({ ok: true });
     });
 
-    router.get('/dc-session', (_req, res) => {
-        const result = { active: !!dcSessionToken };
-        if (dcDeviceToken) result.deviceToken = dcDeviceToken;
+    router.get('/dc-session', (req, res) => {
+        const session = readDcSession(req);
+        const result = { active: !!session.anonToken };
+        if (session.deviceToken) result.deviceToken = session.deviceToken;
         res.json(result);
     });
 
-    router.get('/dc-status', (_req, res) => {
-        const result = { active: !!dcSessionToken };
-        if (dcDeviceToken) result.deviceToken = dcDeviceToken;
+    router.get('/dc-status', (req, res) => {
+        const session = readDcSession(req);
+        const result = { active: !!session.anonToken };
+        if (session.deviceToken) result.deviceToken = session.deviceToken;
         res.json(result);
     });
 
-    router.get('/dc-validate', async (_req, res) => {
-        if (!dcSessionToken) {
+    router.get('/dc-validate', async (req, res) => {
+        const session = readDcSession(req);
+        if (!session.anonToken) {
             const result = { valid: false, reason: 'no token stored' };
-            if (dcDeviceToken) result.deviceToken = dcDeviceToken;
+            if (session.deviceToken) result.deviceToken = session.deviceToken;
             return res.json(result);
         }
 
         try {
-            const response = await testDcToken(dcSessionToken);
+            const response = await testDcToken(session.anonToken, session.deviceToken);
+            const { data, rawText } = await readDcResponse(response);
 
             if (response.ok) {
-                const data = await response.json();
                 const count = data?.totalCount || 0;
-                console.log(`[cl-helper] DC validate: ${count} total chars available`);
+                console.log(`[datacat-plus] DC validate: ${count} total chars available`);
                 const result = { valid: true, totalCount: count };
-                if (dcDeviceToken) result.deviceToken = dcDeviceToken;
+                if (session.deviceToken) result.deviceToken = session.deviceToken;
                 res.json(result);
             } else {
-                const text = await response.text();
-                console.warn(`[cl-helper] DC validate failed: HTTP ${response.status}`);
-                const result = { valid: false, reason: `HTTP ${response.status}: ${text.slice(0, 200)}` };
-                if (dcDeviceToken) result.deviceToken = dcDeviceToken;
+                console.warn(`[datacat-plus] DC validate failed: HTTP ${response.status}`);
+                const result = { valid: false, reason: formatDcError(response, data, rawText, 'DataCat validate') };
+                if (session.deviceToken) result.deviceToken = session.deviceToken;
                 res.json(result);
             }
         } catch (err) {
-            console.error('[cl-helper] DC validate error:', err.message);
-            const result = { valid: false, reason: err.message };
-            if (dcDeviceToken) result.deviceToken = dcDeviceToken;
+            console.error('[datacat-plus] DC validate error:', err.message);
+            const result = { valid: false, reason: `Failed to reach DataCat: ${err.message}` };
+            if (session.deviceToken) result.deviceToken = session.deviceToken;
             res.json(result);
         }
     });
 
     router.post('/dc-auth-login', async (req, res) => {
-        const clientId = requireDcClientId(req, res);
-        if (!clientId) return;
+        const session = readDcSession(req);
 
         const email = normalizeDcCredential(req.body?.email, { maxLength: 320 });
         const password = normalizeDcCredential(req.body?.password, { maxLength: 512 });
@@ -331,41 +418,42 @@ function registerDataCatRoutes(router) {
         }
 
         const body = { email, password };
-        if (dcDeviceToken) body.anonToken = dcDeviceToken;
+        if (session.deviceToken) body.anonToken = session.deviceToken;
 
         try {
             const response = await fetch(`${DATACAT_BASE}/api/auth/login`, {
                 method: 'POST',
-                headers: buildDataCatHeaders({ sessionToken: dcSessionToken, deviceToken: dcDeviceToken, json: true }),
+                headers: buildDataCatHeaders({ sessionToken: session.anonToken, deviceToken: session.deviceToken, json: true }),
                 body: JSON.stringify(body),
             });
-            const data = await readDcJson(response);
+            const { data, rawText } = await readDcResponse(response);
 
             if (data?.success && data?.session?.token) {
                 const accountToken = data.session.token;
-                if (data.newDeviceToken) dcDeviceToken = data.newDeviceToken;
+                let deviceToken = data.newDeviceToken || session.deviceToken;
                 const accountUser = sanitizeDataCatUser(data.user || data.session?.user || null);
-                setDcAccountSession(clientId, accountToken, accountUser);
-                const activation = await activateDcAccountSession(accountToken);
-                if (!activation.ok) {
-                    console.warn('[cl-helper] DC auth login account activation failed:', activation.reason);
+                const activation = await activateDcAccountSession(accountToken, deviceToken);
+                if (activation.ok && activation.deviceToken) {
+                    deviceToken = activation.deviceToken;
+                } else if (!activation.ok) {
+                    console.warn('[datacat-plus] DC auth login account activation failed:', activation.reason);
                 }
-                return res.json({ ok: true, accountToken, deviceToken: dcDeviceToken, user: accountUser });
+                const saved = writeDcSession(req, { accountToken, user: accountUser, deviceToken });
+                return res.json({ ok: true, deviceToken: saved.deviceToken, user: accountUser });
             }
 
             const status = response.ok ? 401 : response.status || 401;
             return res.status(status).json({
-                error: data?.reason || data?.error || `DataCat login failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat login'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC auth login error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC auth login error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
     router.post('/dc-auth-set', async (req, res) => {
-        const clientId = requireDcClientId(req, res);
-        if (!clientId) return;
+        const session = readDcSession(req);
 
         const value = normalizeDcCredential(req.body?.accountToken || req.body?.token);
         if (!value) {
@@ -374,61 +462,63 @@ function registerDataCatRoutes(router) {
 
         const suppliedDeviceToken = req.body?.deviceToken;
         const normalizedDeviceToken = normalizeOptionalDcCredential(suppliedDeviceToken);
-        if (normalizedDeviceToken) dcDeviceToken = normalizedDeviceToken;
+        let deviceToken = normalizedDeviceToken || session.deviceToken;
 
-        const verification = await verifyDcAccountToken(value);
+        const verification = await verifyDcAccountToken(value, deviceToken);
         if (!verification.valid) {
             return res.status(401).json({ valid: false, reason: verification.reason });
         }
 
-        setDcAccountSession(clientId, value, verification.user);
-        const activation = await activateDcAccountSession(value);
-        if (!activation.ok) {
-            console.warn('[cl-helper] DC auth set account activation failed:', activation.reason);
+        const activation = await activateDcAccountSession(value, deviceToken);
+        if (activation.ok && activation.deviceToken) {
+            deviceToken = activation.deviceToken;
+        } else if (!activation.ok) {
+            console.warn('[datacat-plus] DC auth set account activation failed:', activation.reason);
         }
-        return res.json({ ok: true, valid: true, user: verification.user, deviceToken: dcDeviceToken });
+        const saved = writeDcSession(req, { accountToken: value, user: verification.user, deviceToken });
+        return res.json({ ok: true, valid: true, user: verification.user, deviceToken: saved.deviceToken });
     });
 
     router.get('/dc-auth-status', async (req, res) => {
-        const clientId = requireDcClientId(req, res);
-        if (!clientId) return;
-
-        const session = dcAccountSessions.get(clientId);
-        if (!session?.token) {
+        const session = readDcSession(req);
+        if (!session.accountToken) {
             return res.json({ valid: false, reason: 'no account token stored', user: null });
         }
 
-        const verification = await verifyDcAccountToken(session.token);
+        const verification = await verifyDcAccountToken(session.accountToken, session.deviceToken);
         if (verification.valid) {
-            setDcAccountSession(clientId, session.token, verification.user);
-            const activation = await activateDcAccountSession(session.token);
-            if (!activation.ok) {
-                console.warn('[cl-helper] DC auth status account activation failed:', activation.reason);
+            let deviceToken = session.deviceToken;
+            const activation = await activateDcAccountSession(session.accountToken, deviceToken);
+            if (activation.ok && activation.deviceToken) {
+                deviceToken = activation.deviceToken;
+            } else if (!activation.ok) {
+                console.warn('[datacat-plus] DC auth status account activation failed:', activation.reason);
             }
-            return res.json({ valid: true, user: verification.user, deviceToken: dcDeviceToken });
+            const saved = writeDcSession(req, { user: verification.user, deviceToken });
+            return res.json({ valid: true, user: verification.user, deviceToken: saved.deviceToken });
         }
 
-        dcAccountSessions.delete(clientId);
+        writeDcSession(req, { accountToken: null, user: null });
         return res.json({ valid: false, reason: verification.reason, user: null });
     });
 
     router.post('/dc-auth-logout', async (req, res) => {
-        const session = getDcAccountSession(req);
-        const token = session?.token;
-        clearDcAccountSession(req);
+        const session = readDcSession(req);
+        const token = session.accountToken;
+        writeDcSession(req, { accountToken: null, user: null });
 
         if (token) {
             try {
                 const response = await fetch(`${DATACAT_BASE}/api/auth/logout`, {
                     method: 'POST',
-                    headers: buildDataCatHeaders({ sessionToken: token, deviceToken: dcDeviceToken, json: true }),
+                    headers: buildDataCatHeaders({ sessionToken: token, deviceToken: session.deviceToken, json: true }),
                     body: JSON.stringify({ token }),
                 });
                 if (!response.ok) {
-                    console.warn(`[cl-helper] DC auth logout failed: HTTP ${response.status}`);
+                    console.warn(`[datacat-plus] DC auth logout failed: HTTP ${response.status}`);
                 }
             } catch (err) {
-                console.warn('[cl-helper] DC auth logout error:', err.message);
+                console.warn('[datacat-plus] DC auth logout error:', err.message);
             }
         }
 
@@ -437,8 +527,9 @@ function registerDataCatRoutes(router) {
 
     // POST-only: submit extraction request to DataCat
     router.post('/dc-extract', async (req, res) => {
+        let session = readDcSession(req);
         const preferAccount = req.body?.useAccount !== false;
-        const active = getDcActiveToken(req, { preferAccount });
+        const active = getDcActiveToken(session, { preferAccount });
         if (!active.token) {
             return res.status(401).json({ error: 'No DataCat session token configured' });
         }
@@ -476,19 +567,22 @@ function registerDataCatRoutes(router) {
         const alwaysReextract = req.body.alwaysReextract === true;
 
         if (active.source === 'account') {
-            const activation = await activateDcAccountSession(active.token);
+            const activation = await activateDcAccountSession(active.token, session.deviceToken);
             if (!activation.ok) {
                 return res.status(401).json({
                     error: 'Failed to activate DataCat account session',
                     reason: activation.reason,
                 });
             }
+            if (activation.deviceToken) {
+                session = writeDcSession(req, { deviceToken: activation.deviceToken });
+            }
         }
 
         // Resolve a public session ID when public feed is requested
         let sessionId = null;
         if (wantPublicFeed) {
-            sessionId = await getPublicSessionId(active.token);
+            sessionId = await getPublicSessionId(active.token, session.deviceToken);
         }
 
         try {
@@ -523,17 +617,20 @@ function registerDataCatRoutes(router) {
             const response = await fetch(endpoint, {
                 method: 'POST',
                 headers: {
-                    ...buildDataCatHeaders({ sessionToken: active.token, deviceToken: dcDeviceToken, json: true }),
+                    ...buildDataCatHeaders({ sessionToken: active.token, deviceToken: session.deviceToken, json: true }),
                     'X-Request-Id': requestId,
                 },
                 body: JSON.stringify(body),
             });
 
-            const data = await response.json();
-            res.status(response.status).json(data);
+            const { data, rawText } = await readDcResponse(response);
+            if (data !== null) {
+                return res.status(response.status).json(data);
+            }
+            res.status(response.status).json({ error: formatDcError(response, null, rawText, 'DataCat extract') });
         } catch (err) {
-            console.error('[cl-helper] DC extract error:', err.message);
-            res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC extract error:', err.message);
+            res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -614,14 +711,14 @@ function registerDataCatRoutes(router) {
     async function fetchDcAccountEndpoint(account, path, { method = 'GET', body = null, json = false } = {}) {
         const options = {
             method,
-            headers: buildDataCatHeaders({ sessionToken: account.token, deviceToken: dcDeviceToken, json }),
+            headers: buildDataCatHeaders({ sessionToken: account.token, deviceToken: account.deviceToken, json }),
         };
         if (body != null) {
             options.body = JSON.stringify(body);
         }
         const response = await fetch(`${DATACAT_BASE}${path}`, options);
-        const data = await readDcJson(response);
-        return { response, data };
+        const { data, rawText } = await readDcResponse(response);
+        return { response, data, rawText };
     }
 
     router.get('/dc-folders', async (req, res) => {
@@ -631,14 +728,14 @@ function registerDataCatRoutes(router) {
         const params = buildDcFoldersSearchParams(req.query);
         const query = params.toString();
         try {
-            const { response, data } = await fetchDcAccountEndpoint(account, `/api/user-folders${query ? `?${query}` : ''}`);
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, `/api/user-folders${query ? `?${query}` : ''}`);
             if (response.ok && data?.success) return res.json({ ...data, ok: true });
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat folders failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat folders'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC folders list error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC folders list error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -649,14 +746,14 @@ function registerDataCatRoutes(router) {
         if (!body) return res.status(400).json({ error: 'Valid folder title is required' });
 
         try {
-            const { response, data } = await fetchDcAccountEndpoint(account, '/api/user-folders', { method: 'POST', body, json: true });
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, '/api/user-folders', { method: 'POST', body, json: true });
             if (response.ok && data?.success) return res.json({ ...data, ok: true });
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat folder create failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat folder create'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC folder create error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC folder create error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -668,14 +765,14 @@ function registerDataCatRoutes(router) {
         if (!folderIds) return res.status(400).json({ error: 'A valid folderIds list is required' });
 
         try {
-            const { response, data } = await fetchDcAccountEndpoint(account, '/api/user-folders/reorder', { method: 'PUT', body: { folderIds }, json: true });
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, '/api/user-folders/reorder', { method: 'PUT', body: { folderIds }, json: true });
             if (response.ok && data?.success) return res.json({ ...data, ok: true });
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat folder reorder failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat folder reorder'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC folder reorder error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC folder reorder error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -688,14 +785,14 @@ function registerDataCatRoutes(router) {
         if (!body) return res.status(400).json({ error: 'Valid folder title is required' });
 
         try {
-            const { response, data } = await fetchDcAccountEndpoint(account, `/api/user-folders/${encodeURIComponent(String(parseInt(folderId, 10)))}`, { method: 'PATCH', body, json: true });
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, `/api/user-folders/${encodeURIComponent(String(parseInt(folderId, 10)))}`, { method: 'PATCH', body, json: true });
             if (response.ok && data?.success) return res.json({ ...data, ok: true });
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat folder update failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat folder update'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC folder update error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC folder update error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -706,14 +803,14 @@ function registerDataCatRoutes(router) {
         if (!isDataCatFolderId(folderId)) return res.status(400).json({ error: 'Invalid DataCat folder id' });
 
         try {
-            const { response, data } = await fetchDcAccountEndpoint(account, `/api/user-folders/${encodeURIComponent(String(parseInt(folderId, 10)))}`, { method: 'DELETE' });
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, `/api/user-folders/${encodeURIComponent(String(parseInt(folderId, 10)))}`, { method: 'DELETE' });
             if (response.ok && data?.success) return res.json({ ...data, ok: true });
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat folder delete failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat folder delete'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC folder delete error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC folder delete error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -726,16 +823,16 @@ function registerDataCatRoutes(router) {
 
         try {
             const path = `/api/user-folders/${encodeURIComponent(String(parseInt(folderId, 10)))}/items/${encodeURIComponent(characterId)}`;
-            const { response, data } = await fetchDcAccountEndpoint(account, path, { method: shouldAdd ? 'PUT' : 'DELETE' });
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, path, { method: shouldAdd ? 'PUT' : 'DELETE' });
             if (response.ok && data?.success) {
                 return res.json({ ...data, ok: true, folderId: parseInt(folderId, 10), characterId });
             }
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat folder membership failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat folder membership'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC folder membership error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC folder membership error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     }
 
@@ -750,14 +847,14 @@ function registerDataCatRoutes(router) {
         const query = params.toString();
 
         try {
-            const { response, data } = await fetchDcAccountEndpoint(account, `/api/characters${query ? `?${query}` : ''}`);
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, `/api/characters${query ? `?${query}` : ''}`);
             if (response.ok && data?.success !== false) return res.json({ ...data, ok: true });
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat folder characters failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat folder characters'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC folder characters error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC folder characters error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
     router.get('/dc-yours/:characterId/status', async (req, res) => {
@@ -770,11 +867,7 @@ function registerDataCatRoutes(router) {
         }
 
         try {
-            const response = await fetch(`${DATACAT_BASE}/api/characters/${encodeURIComponent(characterId)}/folders`, {
-                method: 'GET',
-                headers: buildDataCatHeaders({ sessionToken: account.token, deviceToken: dcDeviceToken }),
-            });
-            const data = await readDcJson(response);
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, `/api/characters/${encodeURIComponent(characterId)}/folders`);
 
             if (response.ok && data?.success) {
                 return res.json({
@@ -785,11 +878,11 @@ function registerDataCatRoutes(router) {
             }
 
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat folders failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat folders'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC yours status error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC yours status error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -803,22 +896,22 @@ function registerDataCatRoutes(router) {
         }
 
         try {
-            const response = await fetch(`${DATACAT_BASE}/api/characters/${encodeURIComponent(characterId)}/collect`, {
-                method: shouldCollect ? 'POST' : 'DELETE',
-                headers: buildDataCatHeaders({ sessionToken: account.token, deviceToken: dcDeviceToken, json: true }),
-            });
-            const data = await readDcJson(response);
+            const { response, data, rawText } = await fetchDcAccountEndpoint(
+                account,
+                `/api/characters/${encodeURIComponent(characterId)}/collect`,
+                { method: shouldCollect ? 'POST' : 'DELETE', json: true },
+            );
 
             if (response.ok && data?.success) {
                 return res.json({ ok: true, collected: shouldCollect });
             }
 
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat collect failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat collect'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC yours toggle error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC yours toggle error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     }
 
@@ -839,11 +932,7 @@ function registerDataCatRoutes(router) {
         params.set('sortDir', String(req.query.sortDir || 'desc'));
 
         try {
-            const response = await fetch(`${DATACAT_BASE}/api/creators/following?${params.toString()}`, {
-                method: 'GET',
-                headers: buildDataCatHeaders({ sessionToken: account.token, deviceToken: dcDeviceToken }),
-            });
-            const data = await readDcJson(response);
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, `/api/creators/following?${params.toString()}`);
 
             if (response.ok && data?.success) {
                 return res.json({
@@ -854,11 +943,11 @@ function registerDataCatRoutes(router) {
             }
 
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat following failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat following'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC following error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC following error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 
@@ -872,55 +961,51 @@ function registerDataCatRoutes(router) {
         }
 
         try {
-            const response = await fetch(`${DATACAT_BASE}/api/creators/${encodeURIComponent(creatorId)}/follow`, {
-                method: shouldFollow ? 'POST' : 'DELETE',
-                headers: buildDataCatHeaders({ sessionToken: account.token, deviceToken: dcDeviceToken, json: true }),
-            });
-            const data = await readDcJson(response);
+            const { response, data, rawText } = await fetchDcAccountEndpoint(
+                account,
+                `/api/creators/${encodeURIComponent(creatorId)}/follow`,
+                { method: shouldFollow ? 'POST' : 'DELETE', json: true },
+            );
 
             if (response.ok && data?.success) {
                 return res.json({ ok: true, following: data.isFollowing === true });
             }
 
             return res.status(response.status || 502).json({
-                error: data?.reason || data?.error || `DataCat follow failed with HTTP ${response.status}`,
+                error: formatDcError(response, data, rawText, 'DataCat follow'),
             });
         } catch (err) {
-            console.error('[cl-helper] DC follow toggle error:', err.message);
-            return res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC follow toggle error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     }
 
     router.post('/dc-follow/:creatorId', (req, res) => setDcFollow(req, res, true));
     router.delete('/dc-follow/:creatorId', (req, res) => setDcFollow(req, res, false));
 
-    router.get('/dc-proxy/*', async (req, res) => {
-        const active = getDcActiveToken(req, { preferAccount: true });
+    router.get('/dc-proxy/*splat', async (req, res) => {
+        const session = readDcSession(req);
+        const active = getDcActiveToken(session, { preferAccount: true });
         if (!active.token) {
             return res.status(401).json({ error: 'No DataCat session token configured' });
         }
 
-        const targetPath = '/' + req.params[0];
-
-        const normalizedPath = new URL(targetPath, DATACAT_BASE).pathname;
-        if (!DC_ALLOWED_PATHS.some(re => re.test(normalizedPath))) {
-            console.warn(`[cl-helper] DC proxy blocked: ${normalizedPath}`);
-            return res.status(403).json({ error: 'Proxy path not allowed' });
-        }
-
-        const targetUrl = new URL(targetPath, DATACAT_BASE);
-        targetUrl.search = new URL(req.url, 'http://localhost').search;
-
-        if (targetUrl.hostname !== 'datacat.run') {
-            return res.status(403).json({ error: 'Proxy target must be datacat.run' });
-        }
+        const targetUrl = ctx?.helpers?.guardProxyTarget
+            ? ctx.helpers.guardProxyTarget(req, res, {
+                base: DATACAT_BASE,
+                allowedPaths: DC_ALLOWED_PATHS,
+                hosts: 'datacat.run',
+                label: 'DataCat',
+            })
+            : guardDcProxyTargetFallback(req, res);
+        if (!targetUrl) return;
 
         try {
-            const response = await fetchDcProxyTarget(targetUrl, active.token);
+            const response = await fetchDcProxyTarget(targetUrl, active.token, session.deviceToken, ctx);
 
             const contentType = response.headers.get('content-type') || '';
             res.status(response.status);
-            res.set('Content-Type', contentType);
+            if (contentType) res.set('Content-Type', contentType);
 
             if (contentType.includes('application/json')) {
                 res.send(await response.text());
@@ -929,8 +1014,8 @@ function registerDataCatRoutes(router) {
                 res.send(buffer);
             }
         } catch (err) {
-            console.error('[cl-helper] DC proxy error:', err.message);
-            res.status(502).json({ error: 'Failed to reach DataCat' });
+            console.error('[datacat-plus] DC proxy error:', err.message);
+            res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });
 }

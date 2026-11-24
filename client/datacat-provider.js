@@ -4,20 +4,18 @@
 // and AI-powered character scoring. Uses ella.janitorai.com CDN for images.
 // No version history. No authentication required.
 
-import { ProviderBase } from '../provider-interface.js';
-import CoreAPI from '../../core-api.js';
-import { assignGalleryId, importFromPng, fetchWithProxy } from '../provider-utils.js';
-import datacatBrowseView from './datacat-browse.js';
-import { initJanitorBridge } from '../janitor-bridge.js';
+import { ProviderBase } from '/modules/providers/provider-interface.js';
+import CoreAPI from '/modules/core-api.js';
+// CL-only: assignGalleryId removed, Sigma dropped SillyTavern gallery IDs
+import { importFromPng, fetchWithProxy } from '/modules/providers/provider-utils.js';
+import datacatBrowseView, { openDatacatCharPreview } from './datacat-browse.js';
+// CL-only: janitor-bridge.js userscript bridge, no Sigma equivalent
 import './datacat-avatar-restore.js';
+import { PROVIDER_ID } from './datacat-id.js';
 import {
     DATACAT_API_BASE,
     resolveDatacatAvatarUrl,
     setApiRequest,
-    setSavedTokenGetter,
-    setSavedAccountTokenGetter,
-    setSavedDeviceTokenGetter,
-    setDatacatClientIdGetter,
     slugify,
     stripHtml,
     resolveTagNames,
@@ -52,6 +50,19 @@ import {
 } from './datacat-folder-picker.js';
 
 let api = null;
+let _settings = null;
+
+export function setDatacatProviderSettings(settings) {
+    _settings = settings;
+}
+
+function getDcSetting(key) {
+    return _settings ? _settings.get(key) : undefined;
+}
+
+function setDcSetting(key, value) {
+    if (_settings) _settings.set(key, value);
+}
 
 // ========================================
 // PROVIDER CLASS
@@ -60,15 +71,11 @@ let api = null;
 class DatacatProvider extends ProviderBase {
     // ── Identity ────────────────────────────────────────────
 
-    get id() { return 'datacat'; }
-    get name() { return 'DataCat'; }
+    get id() { return PROVIDER_ID; }
+    get name() { return 'DataCat Plus'; }
     get icon() { return 'fa-solid fa-cat'; }
     get iconUrl() { return 'https://datacat.run/catgif.gif'; }
-    // Deprecated supersedes beta: the row shows one status badge, and the enable gate shows the
-    // deprecation notice instead of the old "experimental, expect rough edges" warning.
-    get deprecated() { return true; }
-    get disabledByDefault() { return true; }
-    get minClHelperVersion() { return '1.0.0'; }
+    // CL-only: deprecated, disabledByDefault, minClHelperVersion removed; Sigma reads manifest row (beta: true).
     get browseView() { return datacatBrowseView; }
 
     get linkStatFields() {
@@ -85,18 +92,8 @@ class DatacatProvider extends ProviderBase {
         super.init(coreAPI);
         api = coreAPI;
         setApiRequest(coreAPI.apiRequest);
-        setSavedTokenGetter(() => coreAPI.getSetting('datacatToken') || null);
-        let datacatClientSessionId = coreAPI.getSetting('datacatClientSessionId') || null;
-        if (!datacatClientSessionId) {
-            datacatClientSessionId = globalThis.crypto?.randomUUID?.()
-                || `dc_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-            coreAPI.setSetting('datacatClientSessionId', datacatClientSessionId);
-        }
-        setDatacatClientIdGetter(() => coreAPI.getSetting('datacatClientSessionId') || null);
-        setSavedAccountTokenGetter(() => coreAPI.getSetting('datacatAccountToken') || null);
-        setSavedDeviceTokenGetter(() => coreAPI.getSetting('datacatDeviceToken') || null);
-        // Listen for the optional JanitorAI userscript bridge (passive, free when absent)
-        initJanitorBridge();
+        // CL-only: datacatClientSessionId, datacatToken/AccountToken/DeviceToken getters,
+        // and initJanitorBridge removed -- Sigma keeps sessions server-side and has no janitor-bridge.
     }
 
     // ── View ────────────────────────────────────────────────
@@ -117,40 +114,21 @@ class DatacatProvider extends ProviderBase {
 
     // ── Character Linking ───────────────────────────────────
 
-    getLinkInfo(char) {
-        if (!char) return null;
-        const extensions = char.data?.extensions || char.extensions;
-        const dc = extensions?.datacat;
-        if (!dc) return null;
-
-        const id = dc.id;
+    readLink(ns) {
+        const id = ns.id;
         if (!id) return null;
-
         return {
-            providerId: 'datacat',
             id,
             fullPath: String(id),
-            sourceKind: dc.sourceKind || null,
-            linkedAt: dc.linkedAt || null
+            sourceKind: ns.sourceKind || null,
+            linkedAt: ns.linkedAt || null,
         };
     }
 
-    setLinkInfo(char, linkInfo) {
-        if (!char) return;
-        if (!char.data) char.data = {};
-        if (!char.data.extensions) char.data.extensions = {};
-
-        if (linkInfo) {
-            const existing = char.data.extensions.datacat || {};
-            char.data.extensions.datacat = {
-                id: linkInfo.id,
-                sourceKind: linkInfo.sourceKind || existing.sourceKind || null,
-                linkedAt: linkInfo.linkedAt || new Date().toISOString(),
-                pageName: linkInfo.pageName || existing.pageName || null,
-            };
-        } else {
-            delete char.data.extensions.datacat;
-        }
+    writeLink(linkInfo, existing) {
+        return {
+            sourceKind: linkInfo.sourceKind || existing.sourceKind || null,
+        };
     }
 
     // ── Link Stats ───────────────────────────────────────────
@@ -242,15 +220,15 @@ class DatacatProvider extends ProviderBase {
 
     async refreshRemoteData(linkInfo, options = {}) {
         if (!linkInfo?.id) return;
-        if (CoreAPI.getSetting('datacatReextractOnUpdate') !== true) return;
+        if (getDcSetting('datacatReextractOnUpdate') !== true) return;
 
         const report = options?.onStatus;
 
         try {
-            report?.('Checking cl-helper plugin...');
+            report?.('Checking DataCat Plus server...');
             const pluginOk = await checkDcPluginAvailable();
             if (!pluginOk) {
-                api?.debugLog?.('[DatacatProvider] refreshRemoteData: cl-helper not available, skipping re-extraction');
+                api?.debugLog?.('[DatacatProvider] refreshRemoteData: DataCat Plus server not available, skipping re-extraction');
                 return;
             }
 
@@ -271,13 +249,13 @@ class DatacatProvider extends ProviderBase {
             const upstreamUrl = sourceKind === 'saucepan'
                 ? `https://saucepan.ai/companion/${linkInfo.id}`
                 : `https://janitorai.com/characters/${linkInfo.id}`;
-            const publicFeed = CoreAPI.getSetting('datacatPublicFeed') === true;
+            const publicFeed = getDcSetting('datacatPublicFeed') === true;
 
             report?.('Submitting re-extraction request...');
             const result = await submitExtraction(upstreamUrl, {
                 publicFeed,
                 alwaysReextract: true,
-                useAccount: CoreAPI.getSetting('datacatUseAccountForExtraction') !== false,
+                useAccount: getDcSetting('datacatUseAccountForExtraction') !== false,
             });
             if (!result?.success && !result?.queued && !result?.started) {
                 api?.debugLog?.('[DatacatProvider] refreshRemoteData: extraction submit failed:', result?.error);
@@ -404,7 +382,7 @@ class DatacatProvider extends ProviderBase {
         }
 
         // Fallback to local data
-        const dcData = char?.data?.extensions?.datacat || {};
+        const dcData = char?.data?.extensions?.[PROVIDER_ID] || {};
         return {
             id: charId,
             name: char?.name || 'Unknown',
@@ -417,18 +395,18 @@ class DatacatProvider extends ProviderBase {
     }
 
     openPreview(previewChar) {
-        window.openDatacatCharPreview?.(previewChar);
+        openDatacatCharPreview(previewChar);
     }
 
     // ── Local Import Enrichment ──────────────────────────────
 
     async enrichLocalImport(cardData, _fileName) {
-        const ext = cardData.data?.extensions?.datacat;
+        const ext = cardData.data?.extensions?.[PROVIDER_ID];
         if (ext?.id) {
             return {
                 cardData,
                 providerInfo: {
-                    providerId: 'datacat',
+                    providerId: PROVIDER_ID,
                     charId: ext.id,
                     fullPath: String(ext.id),
                     hasGallery: false,
@@ -510,17 +488,17 @@ class DatacatProvider extends ProviderBase {
 
             // Ensure datacat extension is set. sourceKind persists normalized ('janitor'/'saucepan', the API hint values), not the raw row kind.
             if (!characterCard.data.extensions) characterCard.data.extensions = {};
-            characterCard.data.extensions.datacat = {
-                ...(characterCard.data.extensions.datacat || {}),
+            characterCard.data.extensions[PROVIDER_ID] = {
+                ...(characterCard.data.extensions[PROVIDER_ID] || {}),
                 id: charId,
-                sourceKind: sourceKind || characterCard.data.extensions.datacat?.sourceKind || null,
+                sourceKind: sourceKind || characterCard.data.extensions[PROVIDER_ID]?.sourceKind || null,
                 creatorId: character.creator_id || character.creatorId || null,
                 creatorName: character.creator_name || character.creatorName || null,
                 pageName: this.getListingName(character),
                 linkedAt: new Date().toISOString()
             };
 
-            assignGalleryId(characterCard, options, api);
+            // CL-only: assignGalleryId removed, no Sigma equivalent
 
             // Download avatar. Listing rows top out at datacat's resized variants (640 card /
             // 768 hero); only the detail payload's embedded V2 json points at the untouched
@@ -542,12 +520,13 @@ class DatacatProvider extends ProviderBase {
 
             return await importFromPng({
                 characterCard, imageBuffer,
-                fileName: `datacat_${slugify(characterName)}.png`,
                 characterName,
                 hasGallery: false,
                 providerCharId: charId,
                 fullPath: charId,
                 avatarUrl: avatarUrl || null,
+                onExisting: options?.onExisting || null,
+                source: PROVIDER_ID,
                 api
             });
         } catch (error) {
@@ -570,85 +549,88 @@ class DatacatProvider extends ProviderBase {
 const datacatProvider = new DatacatProvider();
 export default datacatProvider;
 
-// Window-exposed session management (called by settings panel in library.js)
-window.datacatValidateSession = async () => {
+// Exported session & account management (called directly by client/index.js settings UI and datacat-browse.js;
+// CL-only window.datacat* globals removed).
+export async function datacatValidateSession() {
     const pluginOk = await checkDcPluginAvailable();
-    if (!pluginOk) return { valid: false, reason: 'cl-helper plugin not available' };
+    if (!pluginOk) return { valid: false, reason: 'DataCat Plus server not available' };
     return validateDcSession();
-};
+}
 
-window.datacatRestoreAccount = async () => {
+export async function datacatRestoreAccount() {
     const pluginOk = await checkDcPluginAvailable();
-    if (!pluginOk) return { valid: false, reason: 'cl-helper plugin not available' };
+    if (!pluginOk) return { valid: false, reason: 'DataCat Plus server not available' };
     const result = await restoreDatacatAccount();
     if (result?.ok || result?.valid) invalidateDatacatFolderCache();
     return result;
-};
+}
 
-window.datacatLoginAccount = async (email, password) => {
+export async function datacatLoginAccount(email, password) {
     const pluginOk = await checkDcPluginAvailable();
-    if (!pluginOk) return { ok: false, error: 'cl-helper plugin not available' };
+    if (!pluginOk) return { ok: false, error: 'DataCat Plus server not available' };
     const result = await loginDatacatAccount(email, password);
     if (result?.ok) invalidateDatacatFolderCache();
     return result;
-};
+}
 
-window.datacatValidateAccount = async () => {
+export async function datacatValidateAccount() {
     const pluginOk = await checkDcPluginAvailable();
-    if (!pluginOk) return { valid: false, reason: 'cl-helper plugin not available' };
+    if (!pluginOk) return { valid: false, reason: 'DataCat Plus server not available' };
     return validateDatacatAccount();
-};
+}
 
-window.datacatLogoutAccount = async () => {
+export async function datacatLogoutAccount() {
     const pluginOk = await checkDcPluginAvailable();
-    if (!pluginOk) return { ok: false, error: 'cl-helper plugin not available' };
+    if (!pluginOk) return { ok: false, error: 'DataCat Plus server not available' };
     const result = await logoutDatacatAccount();
     if (result?.ok) invalidateDatacatFolderCache();
     return result;
-};
+}
 
-window.datacatRefreshToken = async () => {
+export async function datacatRefreshToken() {
     const pluginOk = await checkDcPluginAvailable();
     if (!pluginOk) return null;
-    return initDcSession(null, true);
-};
+    return initDcSession(true);
+}
 
-window.datacatClearSession = async () => {
+export async function datacatClearSession() {
     return clearDcSession();
-};
+}
 
 // Ordered custom-folder list for the settings Folder Order UI.
-window.datacatGetSettingsFolders = async () => {
+export async function datacatGetSettingsFolders() {
     const res = await fetchDatacatFolders();
     if (!res?.ok) return { ok: false, error: res?.error || res?.reason || 'Could not load folders' };
     const folders = filterPickerFolders(res.folders);
     return { ok: true, folders: sortDatacatFoldersByDisplayOrder(folders) };
-};
+}
 
 // Persist a new custom-folder order on the DataCat account (settings Folder Order UI).
-window.datacatReorderFolders = async (folderIds) => reorderDatacatFolders(folderIds);
+export async function datacatReorderFolders(folderIds) {
+    return reorderDatacatFolders(folderIds);
+}
 
 // ── JanitorAI account session (Supabase; unlocks Hampter pagination) ──────────
 // Stateful layer over the pure grant helpers: persists the access token + rotating
-// refresh token in settings, refreshes proactively, and shares one in-flight refresh
+// refresh token in extension settings, refreshes proactively, and shares one in-flight refresh
 // so concurrent Hampter loads cant race the single-use refresh token.
 let _janitoraiRefreshInFlight = null;
 
 async function janitoraiDoRefresh() {
     if (_janitoraiRefreshInFlight) return _janitoraiRefreshInFlight;
     _janitoraiRefreshInFlight = (async () => {
-        const rt = CoreAPI.getSetting('datacatJanitoraiRefreshToken');
+        const rt = getDcSetting('datacatJanitoraiRefreshToken');
         const res = await janitoraiRefreshGrant(rt);
         if (res.access_token) {
-            CoreAPI.setSetting('datacatJanitoraiToken', res.access_token);
-            if (res.refresh_token) CoreAPI.setSetting('datacatJanitoraiRefreshToken', res.refresh_token);
+            setDcSetting('datacatJanitoraiToken', res.access_token);
+            if (res.refresh_token) setDcSetting('datacatJanitoraiRefreshToken', res.refresh_token);
             return res.access_token;
         }
         // Only wipe the stored session when the refresh token is definitively dead,
         // never on a transient network blip (keeps the user logged in across hiccups).
         if (res.dead) {
-            CoreAPI.setSetting('datacatJanitoraiToken', null);
-            CoreAPI.setSetting('datacatJanitoraiRefreshToken', null);
+            setDcSetting('datacatJanitoraiToken', '');
+            setDcSetting('datacatJanitoraiRefreshToken', '');
         }
         return '';
     })();
@@ -657,21 +639,23 @@ async function janitoraiDoRefresh() {
 }
 
 // Current valid access token, refreshing within 2min of expiry. '' when logged out / refresh failed.
-window.datacatJanitoraiGetToken = async () => {
-    const tok = CoreAPI.getSetting('datacatJanitoraiToken') || '';
+export async function datacatJanitoraiGetToken() {
+    const tok = getDcSetting('datacatJanitoraiToken') || '';
     if (!tok) return '';
     const { expMs } = decodeJanitoraiClaims(tok);
     if (expMs && expMs - Date.now() > 120000) return tok;
     return (await janitoraiDoRefresh()) || '';
-};
+}
 
 // Force a refresh (reactive path after an unexpected 401). Returns the new token or ''.
-window.datacatJanitoraiForceRefresh = async () => janitoraiDoRefresh();
+export async function datacatJanitoraiForceRefresh() {
+    return janitoraiDoRefresh();
+}
 
 // Seed the session from a pasted sb-auth-auth-token cookie (or session JSON / bare JWT).
 // Verification stays off Cloudflare-gated hampter: its preflight can 403 on a perfectly
 // good token, and failing after the up-front rotation would strand the fresh pair.
-window.datacatJanitoraiSetSession = async (pasted) => {
+export async function datacatJanitoraiSetSession(pasted) {
     const pair = parseJanitoraiSession(pasted);
     if (!pair) return { ok: false, error: 'Could not find a session in that value. Copy the whole sb-auth-auth-token cookie.' };
     const { email, expMs } = decodeJanitoraiClaims(pair.access_token);
@@ -697,19 +681,19 @@ window.datacatJanitoraiSetSession = async (pasted) => {
                 : 'That session is expired or invalid. Copy a fresh cookie after logging in again.' };
         }
     }
-    CoreAPI.setSetting('datacatJanitoraiToken', token);
-    CoreAPI.setSetting('datacatJanitoraiRefreshToken', pair.refresh_token || null);
+    setDcSetting('datacatJanitoraiToken', token);
+    setDcSetting('datacatJanitoraiRefreshToken', pair.refresh_token || '');
     return { ok: true, email: decodeJanitoraiClaims(token).email || email, hasRefresh: !!pair.refresh_token };
-};
+}
 
-window.datacatJanitoraiLogout = () => {
-    CoreAPI.setSetting('datacatJanitoraiToken', null);
-    CoreAPI.setSetting('datacatJanitoraiRefreshToken', null);
-};
+export function datacatJanitoraiLogout() {
+    setDcSetting('datacatJanitoraiToken', '');
+    setDcSetting('datacatJanitoraiRefreshToken', '');
+}
 
-window.datacatJanitoraiSessionStatus = () => {
-    const tok = CoreAPI.getSetting('datacatJanitoraiToken') || '';
+export function datacatJanitoraiSessionStatus() {
+    const tok = getDcSetting('datacatJanitoraiToken') || '';
     if (!tok) return { loggedIn: false };
     const { email, expMs } = decodeJanitoraiClaims(tok);
-    return { loggedIn: true, email, expMs, hasRefresh: !!CoreAPI.getSetting('datacatJanitoraiRefreshToken') };
-};
+    return { loggedIn: true, email, expMs, hasRefresh: !!getDcSetting('datacatJanitoraiRefreshToken') };
+}

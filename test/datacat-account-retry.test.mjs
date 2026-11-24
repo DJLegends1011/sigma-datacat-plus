@@ -1,18 +1,16 @@
 import assert from 'node:assert/strict';
 import { describe, it, beforeEach } from 'node:test';
 
-import {
+import './setup-browser-globals.mjs';
+const {
     setApiRequest,
-    setSavedAccountTokenGetter,
-    setSavedDeviceTokenGetter,
-    setDatacatClientIdGetter,
     setDatacatYoursSaved,
     setDatacatFollow,
     fetchDatacatFollowing,
     fetchDatacatFolders,
     setDatacatFolderMembership,
     createDatacatFolder,
-} from '../modules/providers/datacat/datacat-api.js';
+} = await import('../client/datacat-api.js');
 
 // Minimal Response-like stub matching what dcHelperJson consumes:
 // `.ok`, `.status`, and `.clone().text()`.
@@ -40,15 +38,13 @@ function installApiRequest(handler) {
 
 describe('DataCat account-scoped lazy session recovery', () => {
     beforeEach(() => {
-        setSavedDeviceTokenGetter(() => null);
-        setDatacatClientIdGetter(() => 'client-1');
+        // Sessions and account tokens live server-side per Sigma account; no client token/id getters.
     });
 
-    it('restores the account session once and retries after a 401, then succeeds', async () => {
-        setSavedAccountTokenGetter(() => 'acct-token');
+    it('checks /dc-auth-status once and retries after a 401, then succeeds', async () => {
         let restored = false;
         const calls = installApiRequest((path) => {
-            if (path.includes('/dc-auth-set')) {
+            if (path.includes('/dc-auth-status')) {
                 restored = true;
                 return makeResp(200, { ok: true, valid: true, user: { uuid: 'u1' } });
             }
@@ -64,16 +60,18 @@ describe('DataCat account-scoped lazy session recovery', () => {
 
         assert.equal(result.ok, true);
         assert.equal(result.collected, true);
-        // yours(401) -> dc-auth-set(200) -> yours(200)
+        // yours(401) -> dc-auth-status(200) -> yours(200)
         assert.equal(calls.length, 3);
         assert.match(calls[0].path, /\/dc-yours\//);
-        assert.match(calls[1].path, /\/dc-auth-set/);
+        assert.match(calls[1].path, /\/dc-auth-status/);
         assert.match(calls[2].path, /\/dc-yours\//);
     });
 
-    it('does not attempt recovery when no account token is saved', async () => {
-        setSavedAccountTokenGetter(() => null);
+    it('does not retry when /dc-auth-status reports no active account session', async () => {
         const calls = installApiRequest((path) => {
+            if (path.includes('/dc-auth-status')) {
+                return makeResp(200, { ok: false, valid: false, authenticated: false });
+            }
             if (path.includes('/dc-follow/')) {
                 return makeResp(401, { error: 'No DataCat account session configured' });
             }
@@ -84,17 +82,17 @@ describe('DataCat account-scoped lazy session recovery', () => {
 
         assert.equal(result.ok, false);
         assert.equal(result.status, 401);
-        // No /dc-auth-set restore attempt.
-        assert.equal(calls.length, 1);
+        // follow(401) -> dc-auth-status(not authenticated) -> no retry.
+        assert.equal(calls.length, 2);
         assert.match(calls[0].path, /\/dc-follow\//);
+        assert.match(calls[1].path, /\/dc-auth-status/);
     });
 
 
-    it('restores and retries folder list requests after a 401', async () => {
-        setSavedAccountTokenGetter(() => 'acct-token');
+    it('checks /dc-auth-status and retries folder list requests after a 401', async () => {
         let restored = false;
         const calls = installApiRequest((path) => {
-            if (path.includes('/dc-auth-set')) {
+            if (path.includes('/dc-auth-status')) {
                 restored = true;
                 return makeResp(200, { ok: true, valid: true });
             }
@@ -112,12 +110,11 @@ describe('DataCat account-scoped lazy session recovery', () => {
         assert.equal(result.folders.length, 1);
         assert.equal(calls.length, 3);
         assert.match(calls[0].path, /\/dc-folders/);
-        assert.match(calls[1].path, /\/dc-auth-set/);
+        assert.match(calls[1].path, /\/dc-auth-status/);
         assert.match(calls[2].path, /\/dc-folders/);
     });
 
     it('calls folder membership routes with PUT and DELETE', async () => {
-        setSavedAccountTokenGetter(() => 'acct-token');
         const calls = installApiRequest((path) => {
             if (path.includes('/dc-folders/12/items/abc12345')) {
                 return makeResp(200, { ok: true, folderId: 12, characterId: 'abc12345' });
@@ -136,7 +133,6 @@ describe('DataCat account-scoped lazy session recovery', () => {
     });
 
     it('normalizes create folder request bodies', async () => {
-        setSavedAccountTokenGetter(() => 'acct-token');
         const calls = installApiRequest((path, method) => {
             if (path.includes('/dc-folders') && method === 'POST') {
                 return makeResp(200, { ok: true, folder: { id: 12, title: 'Favorites' } });
@@ -150,10 +146,11 @@ describe('DataCat account-scoped lazy session recovery', () => {
         assert.equal(calls.length, 1);
         assert.equal(calls[0].method, 'POST');
         assert.deepEqual(calls[0].data, { title: 'Favorites', description: 'test' });
-    });    it('surfaces the original 401 when recovery itself fails', async () => {
-        setSavedAccountTokenGetter(() => 'acct-token');
+    });
+
+    it('surfaces the original 401 when recovery itself fails', async () => {
         const calls = installApiRequest((path) => {
-            if (path.includes('/dc-auth-set')) {
+            if (path.includes('/dc-auth-status')) {
                 return makeResp(401, { valid: false, reason: 'token expired' });
             }
             if (path.includes('/dc-following')) {
@@ -166,9 +163,9 @@ describe('DataCat account-scoped lazy session recovery', () => {
 
         assert.equal(result.ok, false);
         assert.equal(result.status, 401);
-        // following(401) -> dc-auth-set(401, fails) -> no retry
+        // following(401) -> dc-auth-status(401, fails) -> no retry
         assert.equal(calls.length, 2);
         assert.match(calls[0].path, /\/dc-following/);
-        assert.match(calls[1].path, /\/dc-auth-set/);
+        assert.match(calls[1].path, /\/dc-auth-status/);
     });
 });

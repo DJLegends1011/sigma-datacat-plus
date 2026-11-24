@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { buildV2FromDatacat } from '../modules/providers/datacat/datacat-api.js';
+import './setup-browser-globals.mjs';
+const { buildV2FromDatacat } = await import('../client/datacat-api.js');
 
 // DataCat v0.97 put /api/characters/:id/download behind Cloudflare Turnstile, so
 // every import now falls through to buildV2FromDatacat. The detail payload still

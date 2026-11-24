@@ -5,9 +5,15 @@
 //   - JanitorAI MeiliSearch: text search + sort (activated via janny_* sort modes)
 //   - Extraction: cloud-browser extraction for JanitorAI-only characters
 
-import { BrowseView } from '../browse-view.js';
-import CoreAPI from '../../core-api.js';
-import { IMG_PLACEHOLDER, formatNumber, BROWSE_PURIFY_CONFIG, skeletonLines, deferRender, deferCall, isMobileMode, finishBrowseImport, renderBrowseError } from '../provider-utils.js';
+import { BrowseView } from '/modules/providers/browse-view.js';
+import CoreAPI from '/modules/core-api.js';
+import { IMG_PLACEHOLDER, formatNumber, BROWSE_PURIFY_CONFIG, skeletonLines, deferRender, deferCall, isMobileMode, renderBrowseError } from '/modules/providers/provider-utils.js';
+import { PROVIDER_ID } from './datacat-id.js';
+import {
+    datacatGetSettingsFolders,
+    datacatJanitoraiGetToken,
+    datacatJanitoraiForceRefresh,
+} from './datacat-provider.js';
 import {
     DATACAT_API_BASE,
     resolveDatacatAvatarUrl,
@@ -50,10 +56,26 @@ import {
     buildDatacatYoursFolderFetchOptions,
     preloadDatacatFolderCache,
 } from './datacat-folder-picker.js';
-// Saucepan lives in its own provider now; DataCat only needs these two for its
-// saucepan-SOURCED rows (creator listing + open_definition lock state).
-import { fetchSaucepanCompanion, fetchSaucepanCompanionsOfUser } from '../saucepan/saucepan-api.js';
-import { isJanitorBridgeAvailable } from '../janitor-bridge.js';
+// CL-only: saucepan/saucepan-api.js and janitor-bridge.js removed, no Sigma equivalent
+
+let _settings = null;
+let datacatAccountLoggedIn = false;
+
+export function setDatacatBrowseSettings(settings) {
+    _settings = settings;
+}
+
+export function setDatacatAccountLoggedIn(loggedIn) {
+    datacatAccountLoggedIn = !!loggedIn;
+}
+
+function getDcSetting(key) {
+    return _settings ? _settings.get(key) : undefined;
+}
+
+function setDcSetting(key, value) {
+    if (_settings) _settings.set(key, value);
+}
 
 const {
     onElement: on,
@@ -61,11 +83,6 @@ const {
     escapeHtml,
     debugLog,
     getSetting,
-    setSetting,
-    checkCharacterForDuplicatesAsync,
-    showPreImportDuplicateWarning,
-    deleteCharacter,
-    getCharacterGalleryId,
     formatRichText,
     safePurify,
     renderCreatorNotesSecure,
@@ -74,7 +91,6 @@ const {
     getProviderExcludeTags,
     renderLoadingState,
     renderSkeletonGrid,
-    openGalleryInfoModal,
 } = CoreAPI;
 
 // ========================================
@@ -226,19 +242,12 @@ function isNsfw(hit) {
 // ========================================
 
 function isCharInLocalLibrary(dcChar) {
-    const id = getCharId(dcChar);
-    if (id && view._lookup.byProviderId.has(String(id))) return true;
-
-    const name = (dcChar.name || '').toLowerCase().trim();
-    const creator = getCreatorName(dcChar).toLowerCase().trim();
-    if (name && creator && view._lookup.byNameAndCreator.has(`${name}|${creator}`)) return true;
-
-    return false;
+    return view ? view.isHitInLibrary(dcChar) : false;
 }
 
 function isCharPossibleMatchObj(c) {
     if (isCharInLocalLibrary(c)) return false;
-    return view.isCharPossibleMatch(c.name || '', getCreatorName(c));
+    return !!(view?.getPossibleMatchTier?.(c.name || '', getCreatorName(c))?.show);
 }
 
 /**
@@ -252,7 +261,7 @@ function getSourceKind(hit) {
 }
 
 function isDatacatYoursSyncEnabled() {
-    return !!(getSetting('datacatAccountToken') && getSetting('datacatSyncYours') !== false);
+    return !!(datacatAccountLoggedIn && getDcSetting('datacatSyncYours') !== false);
 }
 
 function normalizeDatacatCollected(hit) {
@@ -594,7 +603,7 @@ function renderGrid(characters, append = false) {
     }
 
     // Client-side: persistent exclude tags from settings
-    const dcPersistentExclude = getProviderExcludeTags('datacat');
+    const dcPersistentExclude = getProviderExcludeTags(PROVIDER_ID);
     if (dcPersistentExclude.length > 0) {
         const lowerExclude = dcPersistentExclude.map(t => t.toLowerCase());
         filtered = filtered.filter(c => {
@@ -647,28 +656,9 @@ async function loadCharacters(append = false) {
 
         if (datacatBrowseMode === 'creator' && datacatCreatorId) {
             if (datacatCreatorSource === 'saucepan') {
-                // Saucepan endpoint returns the full author list in one shot.
-                // Fetch once on the initial load, then paginate client-side.
-                if (!append) {
-                    let full = _saucepanCreatorFullList;
-                    if (!full || full.length === 0) {
-                        const data = await fetchSaucepanCompanionsOfUser(saucepanCreatorHandle);
-                        full = data?.characters || [];
-                    } else {
-                        // Re-sort the cached list (sortCreatorResults mutates in place)
-                        full = full.slice();
-                    }
-                    sortCreatorResults(full, datacatCreatorSortMode);
-                    _saucepanCreatorFullList = full;
-                    list = full.slice(0, PAGE_SIZE);
-                    total = full.length;
-                } else {
-                    list = (_saucepanCreatorFullList || []).slice(
-                        datacatCharacters.length,
-                        datacatCharacters.length + PAGE_SIZE,
-                    );
-                    total = (_saucepanCreatorFullList || []).length;
-                }
+                // CL-only: saucepan creator listing via fetchSaucepanCompanionsOfUser removed, no Sigma equivalent
+                list = [];
+                total = 0;
             } else {
                 const data = await fetchDatacatCreatorCharacters(datacatCreatorId, {
                     limit: PAGE_SIZE,
@@ -700,20 +690,18 @@ async function loadCharacters(append = false) {
                 page: hampterCurrentPage,
                 search: hampterSearchQuery,
                 nsfw: datacatNsfwEnabled,
-                authToken: (await window.datacatJanitoraiGetToken?.()) || '',
+                authToken: (await datacatJanitoraiGetToken()) || '',
                 // Browsing is an explicit user action, so a Cloudflare block here may spend a
                 // clearance-refresh tab. Update checks and other background work never do.
                 allowClearance: true,
             };
             let data;
             try {
-                // The userscript bridge (if installed) carries this past Cloudflare; otherwise the
-                // direct fetch is best-effort and usually blocked. See fetchHampterCharacters.
                 data = await fetchHampterCharacters(fetchOpts);
             } catch (err) {
                 // A 401 despite a token means it was rejected mid-session; refresh once and retry before giving up.
                 if (err?.code === 'HAMPTER_TOKEN_EXPIRED') {
-                    const fresh = (await window.datacatJanitoraiForceRefresh?.()) || '';
+                    const fresh = (await datacatJanitoraiForceRefresh()) || '';
                     if (!fresh) throw err;
                     data = await fetchHampterCharacters({ ...fetchOpts, authToken: fresh });
                 } else {
@@ -873,9 +861,8 @@ async function loadCharacters(append = false) {
         if (isHampterBlocked && append) {
             // Cloudflare block; roll the page back so the next Load More refetches it.
             hampterCurrentPage = Math.max(1, hampterCurrentPage - 1);
-            showToast(isJanitorBridgeAvailable()
-                ? 'Cloudflare blocked this page load. Your janitorai.com Cloudflare pass is missing or expired: open janitorai.com in this browser, let it load, then retry.'
-                : 'Cloudflare blocked this page load. Install the companion userscript for reliable access to these sorts.', 'warning', 6000);
+            // CL-only: isJanitorBridgeAvailable() userscript bridge check removed, no Sigma equivalent
+            showToast('Cloudflare blocked this page load. Try again later or use the MeiliSearch sort orders.', 'warning', 6000);
             return;
         }
         if (!append && grid) {
@@ -886,25 +873,20 @@ async function loadCharacters(append = false) {
                         <i class="fa-solid fa-user-lock" style="font-size: 2rem; color: #f5a623;"></i>
                         <p style="margin-top: 12px; color: var(--text-primary);"><strong>${expired ? 'Your JanitorAI session expired' : 'JanitorAI requires an account for this request'}</strong></p>
                         <p style="margin-top: 8px;">${expired
-                            ? 'JanitorAI tokens last about 3 hours. Re-copy the sb-auth-auth-token cookie and paste it under Settings &rarr; Online &rarr; DataCat.'
-                            : 'The Hampter sorts show the first page without a login. Paste your JanitorAI token under Settings &rarr; Online &rarr; DataCat to browse further, or use the MeiliSearch sort orders, which need no login.'}</p>
+                            ? 'JanitorAI tokens last about 3 hours. Re-copy the sb-auth-auth-token cookie and paste it under Settings &rarr; Online &rarr; DataCat Plus.'
+                            : 'The Hampter sorts show the first page without a login. Paste your JanitorAI token under Settings &rarr; Online &rarr; DataCat Plus to browse further, or use the MeiliSearch sort orders, which need no login.'}</p>
                         <button class="glass-btn" style="margin-top: 12px;" id="datacatRetryBtn">
                             <i class="fa-solid fa-redo"></i> Retry
                         </button>
                     </div>
                 `;
             } else if (isHampterBlocked) {
-                // The bridge can only replay a LIVE cf_clearance cookie; a connected userscript
-                // that still gets 403'd means the pass expired and a site visit refreshes it.
-                const bridgeUp = isJanitorBridgeAvailable();
+                // CL-only: isJanitorBridgeAvailable() and openGalleryInfoModal('providers', 'helpDatacatHampter') removed, no Sigma equivalent
                 grid.innerHTML = `
                     <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted); max-width: 560px; margin: 0 auto;">
                         <i class="fa-solid fa-shield-halved" style="font-size: 2rem; color: #f5a623;"></i>
                         <p style="margin-top: 12px; color: var(--text-primary);"><strong>Cloudflare blocked this request</strong></p>
-                        <p style="margin-top: 8px;">${bridgeUp
-                            ? 'The userscript is connected, but the browser\'s Cloudflare pass for janitorai.com is missing or has expired. Open <a href="https://janitorai.com" target="_blank" rel="noopener" style="color: var(--accent);">janitorai.com</a>, let the page fully load, then retry here. The other JanitorAI sort orders (MeiliSearch) always work.'
-                            : 'JanitorAI\'s Hampter sort orders sit behind Cloudflare, which blocked this load. Direct access is unreliable; the companion <strong>userscript</strong> makes it dependable. The other JanitorAI sort orders (MeiliSearch) always work.'}</p>
-                        ${bridgeUp ? '' : '<p style="margin-top: 12px;"><a href="#" id="datacatHampterHelpLink" style="color: var(--accent);">How to set up the userscript &rarr;</a></p>'}
+                        <p style="margin-top: 8px;">JanitorAI's Hampter sort orders sit behind Cloudflare, which blocked this load. The other JanitorAI sort orders (MeiliSearch) always work.</p>
                         <button class="glass-btn" style="margin-top: 12px;" id="datacatRetryBtn">
                             <i class="fa-solid fa-redo"></i> Retry
                         </button>
@@ -912,7 +894,7 @@ async function loadCharacters(append = false) {
                 `;
             } else {
                 renderBrowseError(grid, {
-                    provider: 'datacat',
+                    provider: PROVIDER_ID,
                     error: err,
                     message: `Load failed: ${err.message}`,
                     view: `browse/${datacatSortMode}`,
@@ -922,10 +904,6 @@ async function loadCharacters(append = false) {
             }
             const retryBtn = document.getElementById('datacatRetryBtn');
             if (retryBtn) retryBtn.addEventListener('click', () => loadCharacters(false));
-            document.getElementById('datacatHampterHelpLink')?.addEventListener('click', (e) => {
-                e.preventDefault();
-                openGalleryInfoModal('providers', 'helpDatacatHampter');
-            });
         }
     } finally {
         if (thisToken === datacatLoadToken) {
@@ -1736,8 +1714,8 @@ async function startExtraction(janitorUrl, janitorId, source = 'janitor') {
 
     try {
         const result = await submitExtraction(janitorUrl, {
-            publicFeed: getSetting('datacatPublicFeed') === true,
-            useAccount: getSetting('datacatUseAccountForExtraction') !== false,
+            publicFeed: getDcSetting('datacatPublicFeed') === true,
+            useAccount: getDcSetting('datacatUseAccountForExtraction') !== false,
         });
 
         if (result.queued || result.started) {
@@ -1967,8 +1945,8 @@ async function startModalExtraction(charId, source = 'janitor') {
 
     try {
         const result = await submitExtraction(sourceUrl, {
-            publicFeed: getSetting('datacatPublicFeed') === true,
-            useAccount: getSetting('datacatUseAccountForExtraction') !== false,
+            publicFeed: getDcSetting('datacatPublicFeed') === true,
+            useAccount: getDcSetting('datacatUseAccountForExtraction') !== false,
         });
 
         if (result.queued || result.started) {
@@ -2089,7 +2067,7 @@ function startModalExtractionPolling(charId, source = 'janitor') {
 // ========================================
 
 function loadFollowedCreators() {
-    const saved = getSetting('datacatFollowedCreators');
+    const saved = getDcSetting('datacatFollowedCreators');
     // Back-compat: pre-source entries default to 'datacat'.
     datacatFollowedCreators = Array.isArray(saved)
         ? saved.map(c => ({ ...c, source: c.source || 'datacat' }))
@@ -2097,13 +2075,13 @@ function loadFollowedCreators() {
 }
 
 function saveFollowedCreators() {
-    setSetting('datacatFollowedCreators', datacatFollowedCreators);
+    setDcSetting('datacatFollowedCreators', datacatFollowedCreators);
 }
 
-// Sync is active whenever a DataCat account token is configured. When off, the
+// Sync is active whenever a DataCat account session is active on the server. When off, the
 // local list is the source of truth (logged-out / per-device behavior).
 function isDatacatFollowSyncEnabled() {
-    return !!getSetting('datacatAccountToken');
+    return datacatAccountLoggedIn;
 }
 
 function setFollowState(creatorId, source, followed) {
@@ -2283,7 +2261,7 @@ async function fetchAllFollowedFromAccount() {
 // One-time push of any pre-sync local follows up to the account, so existing
 // per-device follows survive the switch to account-backed sync.
 async function migrateLocalFollowsToAccount(accountCreators) {
-    if (getSetting('datacatFollowMigrated')) return;
+    if (getDcSetting('datacatFollowMigrated')) return;
     const have = new Set(accountCreators.map(c => `${c.source}:${c.id}`));
     const localOnly = datacatFollowedCreators.filter(c => !have.has(`${c.source || 'datacat'}:${c.id}`));
     for (const c of localOnly) {
@@ -2296,7 +2274,7 @@ async function migrateLocalFollowsToAccount(accountCreators) {
             debugLog('[DatacatFollowing] migration follow failed:', c.id, e.message);
         }
     }
-    setSetting('datacatFollowMigrated', true);
+    setDcSetting('datacatFollowMigrated', true);
 }
 
 async function loadFollowingCharacters(forceRefresh = false) {
@@ -2350,18 +2328,8 @@ async function loadFollowingCharacters(forceRefresh = false) {
                     const source = creator.source || 'datacat';
 
                     if (source === 'saucepan') {
-                        const handle = creator.name; // saucepan handle is stored as name
-                        if (!handle) return [];
-                        const data = await fetchSaucepanCompanionsOfUser(handle);
-                        for (const c of (data?.characters || [])) {
-                            allChars.push({
-                                ...c,
-                                _followedCreatorName: creator.name,
-                                _followedCreatorId: creator.id,
-                                _followedCreatorSource: 'saucepan',
-                            });
-                        }
-                        return allChars;
+                        // CL-only: saucepan creator following via fetchSaucepanCompanionsOfUser removed, no Sigma equivalent
+                        return [];
                     }
 
                     let offset = 0;
@@ -2534,7 +2502,7 @@ function renderFollowing(append = false) {
         filtered = filtered.filter(c => getSourceKind(c) !== 'saucepan');
     }
 
-    const dcPersistentExclude = getProviderExcludeTags('datacat');
+    const dcPersistentExclude = getProviderExcludeTags(PROVIDER_ID);
     if (dcPersistentExclude.length > 0) {
         const lowerExclude = dcPersistentExclude.map(t => t.toLowerCase());
         filtered = filtered.filter(c => {
@@ -2729,12 +2697,8 @@ async function fetchAndPopulateDetails(hit, token) {
     const name = hit.name || 'Unknown';
     const isSaucepanHit = getSourceKind(hit) === 'saucepan';
 
-    // For Saucepan hits, fetch companion detail in parallel to learn whether
-    // the definition is publicly open. The search/listing endpoint omits
-    // `open_definition`, so this is the only way to surface a lock warning.
-    const saucepanDetailPromise = isSaucepanHit
-        ? fetchSaucepanCompanion(charId).catch(() => null)
-        : Promise.resolve(null);
+    // CL-only: saucepan companion lock check via fetchSaucepanCompanion removed, no Sigma equivalent
+    const saucepanDetailPromise = Promise.resolve(null);
 
     function renderLockedDefBanner() {
         return `
@@ -3269,132 +3233,54 @@ async function importCharacter(charData) {
     const charId = getCharId(charData);
     if (!charId) return;
 
-    const importBtn = document.getElementById('datacatImportBtn');
-    if (importBtn) {
-        importBtn.disabled = true;
-        importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Checking...';
-    }
-
-    let inheritedGalleryId = null;
-
-    try {
-        const provider = CoreAPI.getProvider('datacat');
-        if (!provider?.importCharacter) throw new Error('DataCat provider not available');
-
-        if (datacatDetailFetchPromise) {
-            try { await datacatDetailFetchPromise; } catch { /* ignore */ }
-        }
-
-        const character = charData._fullCharacter;
-        if (!character) {
-            showToast('Character definition not available. Try extracting first.', 'warning');
-            if (importBtn) {
-                importBtn.disabled = false;
-                importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
+    await view.importFromPreview({
+        button: document.getElementById('datacatImportBtn'),
+        hit: charData,
+        provider: PROVIDER_ID,
+        id: charId,
+        label: 'DatacatBrowse',
+        closePreview: closePreviewModal,
+        prepare: async () => {
+            if (datacatDetailFetchPromise) {
+                try { await datacatDetailFetchPromise; } catch { /* ignore */ }
             }
-            return;
-        }
-        const charName = character.chat_name || character.name || charData.name || '';
-        const charCreator = character.creator_name || charData.creatorName || charData.creator_name || '';
 
-        // Body resolution mirrors buildV2FromDatacat so the dupe scorer compares body-to-body, not blurb-to-body.
-        const dupeRecovered = pickRecoveryVariant(character);
-        const dupeV2 = character.chara_card_v2_json?.data || null;
-        const dupeBody = getSourceKind(character) === 'saucepan'
-            ? (dupeRecovered?.description || dupeRecovered?.personality || dupeV2?.description || character.description || '')
-            : (character.personality || dupeRecovered?.personality || stripDatacatMarkers(dupeV2?.description) || '');
-        const duplicateMatches = await checkCharacterForDuplicatesAsync({
-            name: charName,
-            creator: charCreator,
-            fullPath: String(charId),
-            description: dupeBody,
-            first_mes: character.first_message || dupeV2?.first_mes || '',
-            scenario: character.scenario || dupeV2?.scenario || ''
-        });
+            const character = charData._fullCharacter;
+            if (!character) {
+                showToast('Character definition not available. Try extracting first.', 'warning');
+                return { cancel: true };
+            }
+            const charName = character.chat_name || character.name || charData.name || '';
+            const charCreator = character.creator_name || charData.creatorName || charData.creator_name || '';
 
-        if (duplicateMatches && duplicateMatches.length > 0) {
-            if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> Duplicate found...';
-
+            // Body resolution mirrors buildV2FromDatacat so the dupe scorer compares body-to-body, not blurb-to-body.
+            const dupeRecovered = pickRecoveryVariant(character);
+            const dupeV2 = character.chara_card_v2_json?.data || null;
+            const dupeBody = getSourceKind(character) === 'saucepan'
+                ? (dupeRecovered?.description || dupeRecovered?.personality || dupeV2?.description || character.description || '')
+                : (character.personality || dupeRecovered?.personality || stripDatacatMarkers(dupeV2?.description) || '');
             const avatarUrl = resolveDatacatAvatarUrl(character) || resolveDatacatAvatarUrl(charData) || '/img/ai4.png';
-            const result = await showPreImportDuplicateWarning({
-                name: charName,
-                creator: charCreator,
-                fullPath: String(charId),
-                avatarUrl
-            }, duplicateMatches);
-
-            if (result.choice === 'skip') {
-                showToast('Import cancelled', 'info');
-                if (importBtn) {
-                    importBtn.disabled = false;
-                    importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
-                }
-                return;
-            }
-
-            if (result.choice === 'replace') {
-                const toReplace = duplicateMatches[0].char;
-                inheritedGalleryId = getCharacterGalleryId(toReplace);
-                if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Replacing...';
-                const deleteSuccess = await deleteCharacter(toReplace, false);
-                if (!deleteSuccess) {
-                    console.warn('[DatacatBrowse] Could not delete existing character, proceeding with import anyway');
-                }
-            }
-        }
-
-        if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Importing...';
-
-        const result = await provider.importCharacter(charId, character, { inheritedGalleryId });
-        if (!result.success) throw new Error(result.error || 'Import failed');
-
-        const mediaUrls = result.embeddedMediaUrls || [];
-        const galleryPageUrls = result.galleryPageUrls || [];
-        const hasGallery = !!result.hasGallery;
-        const showSummary = (hasGallery || mediaUrls.length > 0 || galleryPageUrls.length > 0)
-            && getSetting('importMediaAction') !== 'none';
-
-        const summaryArgs = {
-            galleryCharacters: hasGallery ? [{
-                name: result.characterName,
-                provider,
-                linkInfo: { providerId: 'datacat', id: result.providerCharId },
-                url: `https://datacat.run/characters/${result.providerCharId}`,
-                avatar: result.fileName,
-                galleryId: result.galleryId,
-                cardData: result.cardData
-            }] : [],
-            mediaCharacters: (mediaUrls.length > 0 || galleryPageUrls.length > 0) ? [{
-                characterName: result.characterName,
-                name: result.characterName,
-                fileName: result.fileName,
-                avatar: result.fileName,
-                galleryId: result.galleryId,
-                mediaUrls,
-                galleryPageUrls,
-                cardData: result.cardData
-            }] : []
-        };
-
-        await finishBrowseImport({
-            view,
-            summaryArgs,
-            showSummary,
-            closePreview: closePreviewModal,
-            importBtn,
-            characterName: result.characterName,
-            avatarFileName: result.fileName,
-            markImported: () => markCardAsImported(charId),
-        });
-
-    } catch (err) {
-        console.error('[DatacatBrowse] Import failed:', err);
-        showToast(`Import failed: ${err.message}`, 'error');
-        if (importBtn) {
-            importBtn.disabled = false;
-            importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
-        }
-    }
+            return {
+                data: character,
+                probe: {
+                    name: charName,
+                    creator: charCreator,
+                    fullPath: String(charId),
+                    providerId: PROVIDER_ID,
+                    externalId: charId,
+                    description: dupeBody,
+                    first_mes: character.first_message || dupeV2?.first_mes || '',
+                    scenario: character.scenario || dupeV2?.scenario || '',
+                },
+                dialog: {
+                    name: charName,
+                    creator: charCreator,
+                    fullPath: String(charId),
+                    avatarUrl,
+                },
+            };
+        },
+    });
 }
 
 function markCardAsImported(charId) {
@@ -3467,7 +3353,7 @@ function updateDatacatYoursFolderBar() {
 }
 async function loadDatacatYoursFolders() {
     try {
-        const res = await window.datacatGetSettingsFolders?.();
+        const res = await datacatGetSettingsFolders();
         if (!res?.ok) throw new Error(res?.error || 'Could not load DataCat folders');
         datacatYoursFoldersCache = Array.isArray(res.folders) ? res.folders : [];
     } catch (err) {
@@ -3490,7 +3376,7 @@ let delegatesInitialized = false;
 let modalEventsAttached = false;
 
 function initDatacatView() {
-    datacatNsfwEnabled = getSetting('datacatNsfw') === true;
+    datacatNsfwEnabled = getDcSetting('datacatNsfw') === true;
 
     if (delegatesInitialized) return;
     delegatesInitialized = true;
@@ -3607,7 +3493,7 @@ function initDatacatView() {
     // NSFW toggle
     on('datacatNsfwToggle', 'click', () => {
         datacatNsfwEnabled = !datacatNsfwEnabled;
-        setSetting('datacatNsfw', datacatNsfwEnabled);
+        setDcSetting('datacatNsfw', datacatNsfwEnabled);
         updateNsfwToggle();
         if (datacatViewMode === 'following') {
             renderFollowing();
@@ -3919,17 +3805,28 @@ function ensureModalEventsAttached() {
         });
     }
 
-    window.registerOverlay?.({ id: 'datacatCharModal', tier: 7, close: () => closePreviewModal() });
-    window.registerOverlay?.({ id: 'datacatCreatorBanner', tier: 9, close: () => clearCreatorFilter() });
+    // CL-only: window.registerOverlay replaced by ctx.ui.addOverlay in client/index.js
 }
 
 // ========================================
-// EXPOSE openDatacatCharPreview ON WINDOW
+// EXPORTED PREVIEW & OVERLAY HELPERS
 // ========================================
 
-window.openDatacatCharPreview = function(char) {
+export function openDatacatCharPreview(char) {
     openPreviewModal(char);
-};
+}
+
+export function isPreviewOpen() {
+    const m = document.getElementById('datacatCharModal');
+    return !!(m && !m.classList.contains('hidden'));
+}
+
+export function isCreatorBannerOpen() {
+    const b = document.getElementById('datacatCreatorBanner');
+    return !!(b && !b.classList.contains('hidden'));
+}
+
+export { closePreviewModal, clearCreatorFilter };
 
 // ========================================
 // BROWSE VIEW CLASS
@@ -3942,9 +3839,17 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         view = this;
     }
 
-    _extractProviderIds(char, idSet) {
-        const dcData = char.data?.extensions?.datacat;
-        if (dcData?.id) idSet.add(String(dcData.id));
+    hitLinkKey(hit) {
+        const id = getCharId(hit);
+        return id ? String(id) : null;
+    }
+
+    hitMatchName(hit) {
+        return {
+            name: hit?.name || '',
+            creator: getCreatorName(hit) || '',
+            text: hit?.description || hit?.personality || '',
+        };
     }
 
     // -- Following Manager --
@@ -3980,38 +3885,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         if (!query) return null;
         const raw = query.trim();
 
-        // Saucepan URL or @handle pattern
-        const saucepanUrlMatch = raw.match(/saucepan\.ai\/@?([A-Za-z0-9_.-]+)/i);
-        const atHandleMatch = raw.match(/^@([A-Za-z0-9_.-]+)$/);
-        if (saucepanUrlMatch || atHandleMatch) {
-            const handle = (saucepanUrlMatch?.[1] || atHandleMatch?.[1] || '').trim();
-            if (!handle) return null;
-            // Saucepan stores handle as both display name and lookup key; id = author_id
-            // Try fetching to resolve author_id
-            try {
-                const data = await fetchSaucepanCompanionsOfUser(handle);
-                const list = data?.characters || [];
-                if (list.length === 0) {
-                    showToast(`Saucepan creator "${handle}" not found or has no characters`, 'warning');
-                    return null;
-                }
-                const authorId = list[0]?.creator_id;
-                if (!authorId) {
-                    showToast('Could not resolve Saucepan creator id', 'warning');
-                    return null;
-                }
-                if (isCreatorFollowed(authorId, 'saucepan')) {
-                    showToast('Already following this creator', 'info');
-                    return null;
-                }
-                followCreator(authorId, handle, 'saucepan');
-                return { id: authorId, name: handle };
-            } catch (e) {
-                debugLog('[DatacatFollowing] Saucepan follow lookup failed:', e.message);
-                showToast('Failed to look up Saucepan creator', 'error');
-                return null;
-            }
-        }
+        // CL-only: saucepan @handle follow via fetchSaucepanCompanionsOfUser removed, no Sigma equivalent
 
         let creatorId = raw;
 
@@ -4491,52 +4365,45 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             renderSkeletonGrid(grid);
         }
 
-        // Check cl-helper, auto-init session (with persistence), then load
+        // Check DataCat Plus server, restore server-side account status, auto-init session, then load
         checkDcPluginAvailable().then(async ok => {
             if (!ok) {
                 const g = document.getElementById('datacatGrid');
                 if (g) g.innerHTML = `
                     <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted);">
                         <i class="fa-solid fa-plug-circle-xmark" style="font-size: 2rem; color: var(--cl-warning-bright-darker);"></i>
-                        <p style="margin-top: 12px;">The <strong>cl-helper</strong> server plugin is required for DataCat browsing.</p>
-                        <p style="margin-top: 8px; font-size: 0.85em;">Copy the <code>extras/cl-helper</code> folder into your SillyTavern <code>plugins/</code> directory and restart ST.</p>
-                        <p style="margin-top: 8px;"><a href="https://github.com/Sillyanonymous/SillyTavern-CharacterLibrary#cl-helper-plugin-not-detected" target="_blank" style="color: var(--accent);">Setup instructions</a></p>
+                        <p style="margin-top: 12px;">The <strong>DataCat Plus</strong> server module is not responding.</p>
+                        <p style="margin-top: 8px; font-size: 0.85em;">Verify that DataCat Plus is enabled and the Sigma server is running.</p>
                     </div>
                 `;
                 return;
             }
 
-            // Re-arm the saved DataCat *account* session in cl-helper so account
-            // actions (Yours / follow) work right after startup, the same way
-            // chub/chartavern restore their session on view entry. cl-helper's
-            // in-memory account store is wiped on ST restart; re-pushing the saved
-            // token here restores it. Best-effort and non-blocking -- the browse
-            // grid below uses the anonymous session and doesn't depend on this.
-            const accountRestorePromise = getSetting('datacatAccountToken')
-                ? restoreDatacatAccount().then(res => {
-                    if (!(res?.ok || res?.valid)) {
-                        debugLog('[Datacat] account session restore on init failed:', res?.reason || res?.error || 'unknown');
-                    }
-                    return res;
-                }).catch(() => null)
-                : Promise.resolve(null);
+            // Ask the server whether this Sigma user has an active DataCat account session.
+            // Best-effort and non-blocking -- the browse grid below uses the anonymous session.
+            const accountRestorePromise = restoreDatacatAccount().then(res => {
+                const loggedIn = !!(res?.ok || res?.valid || res?.loggedIn);
+                setDatacatAccountLoggedIn(loggedIn);
+                return res;
+            }).catch(() => {
+                setDatacatAccountLoggedIn(false);
+                return null;
+            });
 
             const bootstrapDcSession = async () => {
                 const g = document.getElementById('datacatGrid');
                 if (g) renderSkeletonGrid(g);
-                const savedToken = getSetting('datacatToken') || null;
-                const token = await initDcSession(savedToken);
+                const token = await initDcSession(false);
                 if (token) {
-                    if (token !== savedToken) setSetting('datacatToken', token);
                     loadCharacters(false);
+                    await accountRestorePromise;
                     if (isDatacatYoursSyncEnabled()) {
-                        await accountRestorePromise;
                         preloadDatacatFolderCache();
                     }
                 } else {
                     renderBrowseError(document.getElementById('datacatGrid'), {
-                        provider: 'datacat',
-                        error: new Error('Failed to initialize a DataCat session (cl-helper /dc-init returned no token)'),
+                        provider: PROVIDER_ID,
+                        error: new Error('Failed to initialize a DataCat session (/dc-init returned no token)'),
                         message: 'Failed to initialize a DataCat session. DataCat may be temporarily unavailable.',
                         retry: bootstrapDcSession,
                     });
@@ -4621,16 +4488,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
 
     }
 
-    // -- Library Lookup (BrowseView contract) --
-
-    refreshInLibraryBadges() {
-        super.refreshInLibraryBadges(card => {
-            const id = card.dataset.datacatId;
-            const name = card.querySelector('.browse-card-name')?.textContent || '';
-            const creatorName = card.querySelector('.browse-card-creator-link')?.textContent || '';
-            return isCharInLocalLibrary({ characterId: id, name, creatorName });
-        });
-    }
+    // -- Library Lookup (BrowseView contract: inherited refreshInLibraryBadges uses hitLinkKey + _getImageGridIds) --
 
     deactivate() {
         datacatDetailFetchToken++;

@@ -3,9 +3,10 @@
 // proposes the original-resolution avatar side by side, and swaps approved ones via
 // ST's /characters/edit-avatar (re-embeds existing card JSON, so card data is untouched).
 
-import CoreAPI from '../../core-api.js';
+import CoreAPI from '/modules/core-api.js';
 import { fetchDatacatCharacter, resolveDatacatAvatarUrl } from './datacat-api.js';
-import { fetchWithProxy } from '../provider-utils.js';
+import { fetchWithProxy } from '/modules/providers/provider-utils.js';
+import { PROVIDER_ID } from './datacat-id.js';
 
 const MODAL_ID = 'datacatAvatarRestoreModal';
 const MIN_UPGRADE_RATIO = 1.2;
@@ -47,12 +48,22 @@ function injectModal() {
     byId(MODAL_ID)?.addEventListener('click', (e) => {
         if (e.target.id === MODAL_ID) closeModal();
     });
-    window.registerOverlay?.({
-        id: MODAL_ID,
-        tier: 7,
-        close: () => closeModal(),
-        visible: (el) => el.classList.contains('visible'),
-    });
+    // Overlay registration is handled by client/index.js via ctx.ui.addOverlay.
+}
+
+export function isRestoreModalOpen() {
+    return !!byId(MODAL_ID)?.classList.contains('visible');
+}
+
+export async function closeRestoreModal() {
+    return closeModal();
+}
+
+export function disposeRestoreModal() {
+    opToken++;
+    running = false;
+    byId(MODAL_ID)?.remove();
+    injected = false;
 }
 
 async function closeModal() {
@@ -73,14 +84,10 @@ async function closeModal() {
     byId(MODAL_ID)?.classList.remove('visible');
 }
 
-function openRestoreModal() {
+export function openRestoreModal() {
     injectModal();
     byId(MODAL_ID)?.classList.add('visible');
-    if (CoreAPI.isExtensionsRecoveryInProgress?.()) {
-        byId('datacatRestoreBody').innerHTML = '<p class="datacat-restore-hint">Provider links are still being recovered from SillyTavern. Try again in a moment.</p>';
-        byId('datacatRestoreFooter').innerHTML = '';
-        return;
-    }
+    // CL-only: CoreAPI.isExtensionsRecoveryInProgress (SillyTavern extension recovery), no Sigma equivalent
     startScan();
 }
 
@@ -137,7 +144,11 @@ function renderScanProgress() {
 async function startScan() {
     const token = ++opToken;
     running = true;
-    const linked = CoreAPI.getAllCharacters().filter(c => c?.data?.extensions?.datacat?.id);
+    const allLinked = await CoreAPI.getAllLinkedCharacters();
+    const linked = (Array.isArray(allLinked) ? allLinked : [])
+        .filter(entry => entry?.provider?.id === PROVIDER_ID || entry?.char?.data?.extensions?.[PROVIDER_ID]?.id)
+        .map(entry => entry.char)
+        .filter(Boolean);
     counts = { total: linked.length, scanned: 0, candidates: 0, fine: 0, gone: 0, sanitized: 0, failed: 0 };
     candidates = [];
 
@@ -168,7 +179,8 @@ async function startScan() {
 
 async function scanOne(char, token) {
     try {
-        const ext = char.data.extensions.datacat;
+        const ext = char.data?.extensions?.[PROVIDER_ID];
+        if (!ext?.id) { counts.gone++; return; }
         const detail = await fetchDatacatCharacter(ext.id, ext.sourceKind || null);
         if (token !== opToken) return;
         if (!detail) { counts.gone++; return; }
@@ -184,15 +196,16 @@ async function scanOne(char, token) {
         const hash = await CoreAPI.calculateHash(buf);
         if (MODERATION_PLACEHOLDER_HASHES.has(hash)) { counts.sanitized++; return; }
 
-        const localUrl = CoreAPI.getCharacterAvatarUrl(char.avatar);
+        const charKey = char.id || char.avatar;
+        const localUrl = CoreAPI.getCharacterAvatarUrl(charKey);
         const [localDims, remoteDims] = await Promise.all([loadDims(localUrl), bufDims(buf, remoteUrl)]);
         if (token !== opToken) return;
         if (!localDims || !remoteDims) { counts.failed++; return; }
 
         if (remoteDims.w >= localDims.w * MIN_UPGRADE_RATIO) {
             candidates.push({
-                avatar: char.avatar,
-                name: char.name || char.avatar,
+                avatar: charKey,
+                name: char.name || charKey,
                 localUrl, localW: localDims.w, localH: localDims.h,
                 remoteUrl, remoteW: remoteDims.w, remoteH: remoteDims.h,
                 checked: true, applied: null,
@@ -322,22 +335,14 @@ async function applySelected() {
             const buf = await resp.arrayBuffer();
             if (token !== opToken) return;
 
-            const formData = new FormData();
-            // edit-avatar re-encodes as PNG and re-embeds the existing card JSON, so the
-            // source format doesnt matter and card data can't be touched by this write.
-            formData.append('avatar', new File([buf], 'avatar.png', { type: 'image/png' }));
-            formData.append('avatar_url', c.avatar);
-            const avatarResp = await fetch('/api/characters/edit-avatar', {
-                method: 'POST',
-                headers: { 'X-CSRF-Token': CoreAPI.getCSRFToken() },
-                body: formData,
-            });
-            if (!avatarResp.ok) throw new Error(`edit-avatar HTTP ${avatarResp.status}`);
+            // CL-only: ST /api/characters/edit-avatar + CoreAPI.getCSRFToken + notifySTCharacterEdited
+            // replaced by Sigma's CoreAPI.editAvatar + notifyCharacterChanged.
+            await CoreAPI.editAvatar(c.avatar, buf);
 
             c.applied = true;
             upgraded++;
             CoreAPI.bumpAvatarCacheBust(c.avatar);
-            CoreAPI.notifySTCharacterEdited(c.avatar);
+            CoreAPI.notifyCharacterChanged?.(c.avatar);
             setRowStatus(i, '<i class="fa-solid fa-circle-check" style="color: var(--cl-success-bright);"></i>');
             const row = byId('datacatRestoreBody')?.querySelector(`.datacat-restore-row[data-idx="${i}"]`);
             row?.querySelector('input[type="checkbox"]')?.setAttribute('disabled', '');
@@ -365,7 +370,4 @@ async function applySelected() {
     );
 }
 
-// Settings-panel consumer (same self-exposure family as window.datacatValidateSession).
-window.datacatRestoreAvatars = openRestoreModal;
-
-export default { openRestoreModal };
+export default { openRestoreModal, closeRestoreModal, isRestoreModalOpen, disposeRestoreModal };

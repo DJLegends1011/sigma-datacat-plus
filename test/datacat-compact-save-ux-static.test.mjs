@@ -3,19 +3,11 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const browse = await readFile(
-    new URL('../modules/providers/datacat/datacat-browse.js', import.meta.url),
+    new URL('../client/datacat-browse.js', import.meta.url),
     'utf8',
 );
 const folderPicker = await readFile(
-    new URL('../modules/providers/datacat/datacat-folder-picker.js', import.meta.url),
-    'utf8',
-);
-const css = await readFile(
-    new URL('../modules/providers/browse-shared.css', import.meta.url),
-    'utf8',
-);
-const mobile = await readFile(
-    new URL('../app/library-mobile.js', import.meta.url),
+    new URL('../client/datacat-folder-picker.js', import.meta.url),
     'utf8',
 );
 
@@ -64,20 +56,10 @@ test('DataCat Features follows maintainer Personal and Library grouping', () => 
     assert.doesNotMatch(browse, /id="datacatFilterOnlyYours"[^>]*>[\s\S]{0,220}Only DataCat Yours<\/label>/);
 });
 
-test('compact metadata actions have shared desktop and mobile treatment', () => {
-    assert.match(css, /\.browse-meta-action\s*\{/);
-    assert.match(css, /\.browse-meta-action\.favorited/);
-    assert.match(css, /\.browse-meta-action:disabled/);
-    assert.match(mobile, /querySelectorAll\('\.browse-meta-action'\)/);
-    assert.match(mobile, /metaAction\.title \|\| metaAction\.getAttribute\('aria-label'\)/);
-    assert.match(mobile, /metaAction\.click\(\)/);
-});
-test('mobile overflow omits hidden metadata actions', () => {
-    assert.match(
-        mobile,
-        /metaAction\.hidden \|\| metaAction\.style\.display === 'none' \|\| getComputedStyle\(metaAction\)\.display === 'none'/,
-    );
-});
+// CL-only host files (../modules/providers/browse-shared.css and ../app/library-mobile.js)
+// do not exist in this extension repo and Sigma core does not define .browse-meta-action.
+test.skip('compact metadata actions have shared desktop and mobile treatment (CL host-only)', () => {});
+test.skip('mobile overflow omits hidden metadata actions (CL host-only)', () => {});
 
 test('DataCat folder heart skips redundant DOM updates', () => {
     assert.match(browse, /const wasFav = btn\.classList\.contains\('favorited'\)/);

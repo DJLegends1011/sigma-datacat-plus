@@ -2,10 +2,11 @@
 //
 // Sections: Network, Metadata, Browse/Search, Tags, V2 Card Builder, Extraction, MeiliSearch
 
-import CoreAPI from '../../core-api.js';
-import { CL_HELPER_PLUGIN_BASE, slugify, stripHtml, readJsonClassified, classifyErrorPage } from '../provider-utils.js';
-import { meiliMultiSearch, TAG_MAP as JANNY_TAG_MAP } from '../janny/janny-api.js';
-import { isJanitorBridgeAvailable, janitorBridgeFetch } from '../janitor-bridge.js';
+import CoreAPI from '/modules/core-api.js';
+import { slugify, stripHtml, readJsonClassified, classifyErrorPage } from '/modules/providers/provider-utils.js';
+import { meiliMultiSearch, TAG_MAP as JANNY_TAG_MAP } from '/modules/providers/janny/janny-api.js';
+// CL-only: janitor-bridge.js userscript bridge, no Sigma equivalent
+import { EXT_ID, PROVIDER_ID } from './datacat-id.js';
 
 export { slugify, stripHtml, JANNY_TAG_MAP };
 
@@ -86,13 +87,10 @@ export const MIN_TOTAL_TOKENS = 889;
 // NETWORK
 // ========================================
 
-const DC_PROXY_BASE = `${CL_HELPER_PLUGIN_BASE}/dc-proxy`;
+const DC_EXT_BASE = `/ext/${EXT_ID}`;
+const DC_PROXY_BASE = `${DC_EXT_BASE}/dc-proxy`;
 
 let _apiRequest = null;
-let _getSavedToken = null;
-let _getSavedAccountToken = null;
-let _getSavedDeviceToken = null;
-let _getDatacatClientId = null;
 let _bootstrapInFlight = null;
 
 /**
@@ -101,52 +99,18 @@ let _bootstrapInFlight = null;
  */
 export function setApiRequest(fn) { _apiRequest = fn; }
 
-/**
- * Bind a getter that returns the persisted DataCat session token (or null).
- * Lets dcFetch lazy-bootstrap a session for out-of-browse-view callers
- * (link modal preview, gallery download, gallery-sync) without coupling
- * the api file to CoreAPI/settings directly. Called once from init().
- */
-export function setSavedTokenGetter(fn) { _getSavedToken = fn; }
-
-export function setSavedAccountTokenGetter(fn) { _getSavedAccountToken = fn; }
-
-export function setSavedDeviceTokenGetter(fn) { _getSavedDeviceToken = fn; }
-
-export function setDatacatClientIdGetter(fn) { _getDatacatClientId = fn; }
-
-export function getDatacatClientId() {
-    const id = _getDatacatClientId?.();
-    if (typeof id !== 'string') return null;
-    const trimmed = id.trim();
-    return trimmed || null;
-}
-
-export function getDatacatClientHeaders() {
-    const id = getDatacatClientId();
-    return id ? { 'X-CL-Datacat-Client': id } : {};
-}
+// CL-only: setSavedTokenGetter, setSavedAccountTokenGetter, setSavedDeviceTokenGetter,
+// setDatacatClientIdGetter, X-CL-Datacat-Client header removed -- Sigma keeps sessions
+// and account tokens per-user server-side.
 
 export async function dcHelperRequest(path, method = 'GET', data = null) {
-    const headers = getDatacatClientHeaders();
     if (_apiRequest) {
-        if (Object.keys(headers).length === 0) {
-            return _apiRequest(path, method, data);
-        }
-        const apiHeaders = {
-            'Content-Type': 'application/json',
-            'X-CSRF-Token': window.getCSRFToken?.() || '',
-            ...headers,
-        };
-        return _apiRequest(path, method, data, { headers: apiHeaders });
+        return _apiRequest(path, method, data);
     }
 
     const config = {
         method,
-        headers: {
-            'X-CSRF-Token': window.getCSRFToken?.() || '',
-            ...headers,
-        },
+        headers: {},
     };
     if (data != null) {
         config.headers['Content-Type'] = 'application/json';
@@ -188,7 +152,7 @@ export async function dcHelperJson(path, method = 'GET', data = null) {
 }
 
 /**
- * Push the saved token (or a fresh anonymous one) into cl-helper. Returns
+ * Initialize or refresh a DataCat session on the extension server. Returns
  * true if a usable session is now active. Concurrent callers share the
  * in-flight bootstrap promise so we never run more than one /dc-init at
  * a time. Reset on completion so a future 401 can re-arm.
@@ -197,8 +161,7 @@ async function tryBootstrapSession() {
     if (_bootstrapInFlight) return _bootstrapInFlight;
     _bootstrapInFlight = (async () => {
         try {
-            const savedToken = _getSavedToken?.() ?? null;
-            return !!(await initDcSession(savedToken));
+            return !!(await initDcSession());
         } catch {
             return false;
         } finally {
@@ -209,13 +172,13 @@ async function tryBootstrapSession() {
 }
 
 /**
- * Fetch a DataCat API path through the cl-helper plugin proxy.
+ * Fetch a DataCat API path through the extension server proxy.
  * On 401/403, attempts to bootstrap a session once and retries.
  * @param {string} apiPath - Path relative to datacat.run (e.g. /api/characters/recent-public?...)
  * @returns {Promise<Response>}
  */
 async function dcFetch(apiPath) {
-    if (!_apiRequest) throw new Error('DataCat: apiRequest not bound (cl-helper required)');
+    if (!_apiRequest) throw new Error('DataCat: apiRequest not bound');
     let resp = await dcHelperRequest(`${DC_PROXY_BASE}${apiPath}`);
     if (resp.status === 401 || resp.status === 403) {
         if (await tryBootstrapSession()) {
@@ -231,67 +194,30 @@ async function dcFetch(apiPath) {
 }
 
 /**
- * Check if the cl-helper plugin is available.
+ * Check if the DataCat Plus server half is reachable.
  * @returns {Promise<boolean>}
  */
 export async function checkDcPluginAvailable() {
     try {
-        const resp = _apiRequest
-            ? await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/health`)
-            : await fetch(`/api${CL_HELPER_PLUGIN_BASE}/health`);
-        if (!resp.ok) return false;
-        const data = await resp.json();
-        return data?.ok === true;
+        const resp = await dcHelperRequest(`${DC_EXT_BASE}/dc-session`);
+        return !!resp?.ok;
     } catch {
         return false;
     }
 }
 
 /**
- * Try to restore a saved DataCat session token via cl-helper.
- * Pushes the saved token to cl-helper and validates it.
- * @param {string} savedToken - Previously saved session token
- * @returns {Promise<boolean>} true if the saved token is still valid
+ * Initialize a DataCat session via the extension server.
+ * @param {boolean} [force] - Force a new session even if one is cached
+ * @returns {Promise<string|boolean|null>} Active token/truthy on success, or null on failure
  */
-async function restoreSavedToken(savedToken) {
-    if (!savedToken || typeof savedToken !== 'string') return false;
+export async function initDcSession(force = false) {
     try {
-        const deviceToken = _getSavedDeviceToken?.() || null;
-        const body = { token: savedToken };
-        if (deviceToken) body.deviceToken = deviceToken;
-        const setResp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-set-token`, 'POST', body);
-        if (!setResp.ok) return false;
-
-        const valResp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-validate`);
-        if (!valResp.ok) return false;
-        const data = await valResp.json();
-        return data?.valid === true;
-    } catch {
-        return false;
-    }
-}
-
-/**
- * Initialize a DataCat session via cl-helper.
- * If a saved token is provided, tries to restore it first.
- * Otherwise (or if saved token is invalid), requests a fresh session.
- * Returns the active token string on success so the caller can persist it.
- * @param {string} [savedToken] - Previously saved session token to try first
- * @param {boolean} [force] - Force a new token even if one is cached
- * @returns {Promise<string|null>} The active session token, or null on failure
- */
-export async function initDcSession(savedToken, force = false) {
-    try {
-        // Try restoring a saved token first (unless forcing refresh)
-        if (savedToken && !force) {
-            const restored = await restoreSavedToken(savedToken);
-            if (restored) return savedToken;
-        }
-
-        const resp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-init`, 'POST', force ? { force: true } : null);
+        const forceFlag = typeof force === 'boolean' ? force : !!arguments[1];
+        const resp = await dcHelperRequest(`${DC_EXT_BASE}/dc-init`, 'POST', forceFlag ? { force: true } : null);
         if (!resp.ok) return null;
         const data = await resp.json();
-        if (data?.ok && data?.token) return data.token;
+        if (data?.ok) return data.token || true;
         return null;
     } catch {
         return null;
@@ -299,12 +225,12 @@ export async function initDcSession(savedToken, force = false) {
 }
 
 /**
- * Validate the current DataCat session on cl-helper.
+ * Validate the current DataCat session on the extension server.
  * @returns {Promise<{valid: boolean, reason?: string}>}
  */
 export async function validateDcSession() {
     try {
-        const resp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-validate`);
+        const resp = await dcHelperRequest(`${DC_EXT_BASE}/dc-validate`);
         if (!resp.ok) return { valid: false, reason: 'request failed' };
         return await resp.json();
     } catch {
@@ -313,64 +239,58 @@ export async function validateDcSession() {
 }
 
 /**
- * Clear the DataCat session token from cl-helper.
+ * Clear the DataCat session on the extension server.
  * @returns {Promise<boolean>}
  */
 export async function clearDcSession() {
     try {
-        const resp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-clear-token`, 'POST');
+        const resp = await dcHelperRequest(`${DC_EXT_BASE}/dc-clear-token`, 'POST');
         return resp.ok;
     } catch {
         return false;
     }
 }
 
+/**
+ * Ask the extension server for the current per-user DataCat account status.
+ * Account tokens are stored server-side only; no client-side restore-from-settings flow.
+ */
 export async function restoreDatacatAccount() {
-    const accountToken = _getSavedAccountToken?.() || null;
-    if (!accountToken) return { valid: false, reason: 'no saved account token', user: null };
-    const deviceToken = _getSavedDeviceToken?.() || null;
-    return dcHelperJson(`${CL_HELPER_PLUGIN_BASE}/dc-auth-set`, 'POST', { accountToken, deviceToken });
+    return dcHelperJson(`${DC_EXT_BASE}/dc-auth-status`);
 }
 
 /**
- * Account-scoped cl-helper call with one-shot session recovery.
- *
- * The account session lives in cl-helper's in-memory store and is wiped when
- * the ST server restarts. Account endpoints (yours / follow / following) then
- * 401 with "No DataCat account session configured" even though the saved
- * account token still lives in settings. On that 401 we re-push the saved
- * token via restoreDatacatAccount() once and retry -- mirroring how dcFetch
- * self-heals the anonymous browse session. If no account token is saved, or
- * recovery fails, the original 401 is returned untouched for the caller to
- * surface as an error.
+ * Account-scoped server call with one-shot status check + retry on 401.
+ * Account tokens live server-side; on 401 we check /dc-auth-status once and
+ * retry only if the server reports an active/restored account session.
  */
 async function dcAccountJson(path, method = 'GET', data = null) {
     const result = await dcHelperJson(path, method, data);
-    if (result?.status !== 401 || !_getSavedAccountToken?.()) return result;
-    const restore = await restoreDatacatAccount();
-    if (!(restore?.ok || restore?.valid)) return result;
+    if (result?.status !== 401) return result;
+    const status = await restoreDatacatAccount();
+    if (!(status?.ok || status?.valid || status?.authenticated)) return result;
     return dcHelperJson(path, method, data);
 }
 
 export async function loginDatacatAccount(email, password) {
-    return dcHelperJson(`${CL_HELPER_PLUGIN_BASE}/dc-auth-login`, 'POST', { email, password });
+    return dcHelperJson(`${DC_EXT_BASE}/dc-auth-login`, 'POST', { email, password });
 }
 
 export async function validateDatacatAccount() {
-    return dcHelperJson(`${CL_HELPER_PLUGIN_BASE}/dc-auth-status`);
+    return dcHelperJson(`${DC_EXT_BASE}/dc-auth-status`);
 }
 
 export async function logoutDatacatAccount() {
-    return dcHelperJson(`${CL_HELPER_PLUGIN_BASE}/dc-auth-logout`, 'POST');
+    return dcHelperJson(`${DC_EXT_BASE}/dc-auth-logout`, 'POST');
 }
 
 export async function fetchDatacatYoursStatus(characterId) {
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-yours/${encodeURIComponent(characterId)}/status`);
+    return dcAccountJson(`${DC_EXT_BASE}/dc-yours/${encodeURIComponent(characterId)}/status`);
 }
 
 export async function setDatacatYoursSaved(characterId, saved) {
     const method = saved ? 'POST' : 'DELETE';
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-yours/${encodeURIComponent(characterId)}`, method);
+    return dcAccountJson(`${DC_EXT_BASE}/dc-yours/${encodeURIComponent(characterId)}`, method);
 }
 
 /**
@@ -380,7 +300,7 @@ export async function setDatacatYoursSaved(characterId, saved) {
  */
 export async function fetchDatacatFollowing(opts = {}) {
     const path = buildDatacatFollowingPath(opts).replace('/api/creators/following', '/dc-following');
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${path}`);
+    return dcAccountJson(`${DC_EXT_BASE}${path}`);
 }
 
 /**
@@ -391,7 +311,7 @@ export async function fetchDatacatFollowing(opts = {}) {
  */
 export async function setDatacatFollow(creatorId, follow) {
     const method = follow ? 'POST' : 'DELETE';
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-follow/${encodeURIComponent(creatorId)}`, method);
+    return dcAccountJson(`${DC_EXT_BASE}/dc-follow/${encodeURIComponent(creatorId)}`, method);
 }
 
 export const DATACAT_MAIN_FOLDER_ID = 'main';
@@ -501,13 +421,13 @@ export function buildDatacatFolderItemPath(folderId, characterId) {
 }
 
 export async function fetchDatacatFolders(opts = {}) {
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${buildDatacatFoldersPath(opts)}`);
+    return dcAccountJson(`${DC_EXT_BASE}${buildDatacatFoldersPath(opts)}`);
 }
 
 export async function createDatacatFolder(payload = {}) {
     const body = normalizeDatacatFolderPayload(payload);
     if (!body) return { ok: false, error: 'Folder title is required' };
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-folders`, 'POST', body);
+    return dcAccountJson(`${DC_EXT_BASE}/dc-folders`, 'POST', body);
 }
 
 export async function updateDatacatFolder(folderId, payload = {}) {
@@ -515,13 +435,13 @@ export async function updateDatacatFolder(folderId, payload = {}) {
     const body = normalizeDatacatFolderPayload(payload);
     if (!Number.isInteger(folder) || folder <= 0) return { ok: false, error: 'Invalid DataCat folder id' };
     if (!body) return { ok: false, error: 'Folder title is required' };
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-folders/${encodeURIComponent(String(folder))}`, 'PATCH', body);
+    return dcAccountJson(`${DC_EXT_BASE}/dc-folders/${encodeURIComponent(String(folder))}`, 'PATCH', body);
 }
 
 export async function deleteDatacatFolder(folderId) {
     const folder = normalizeDatacatFolderId(folderId);
     if (!Number.isInteger(folder) || folder <= 0) return { ok: false, error: 'Invalid DataCat folder id' };
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-folders/${encodeURIComponent(String(folder))}`, 'DELETE');
+    return dcAccountJson(`${DC_EXT_BASE}/dc-folders/${encodeURIComponent(String(folder))}`, 'DELETE');
 }
 
 /**
@@ -534,7 +454,7 @@ export async function deleteDatacatFolder(folderId) {
 export async function reorderDatacatFolders(folderIds) {
     const ids = normalizeDatacatFolderIdList(folderIds);
     if (!ids) return { ok: false, error: 'Invalid DataCat folder order' };
-    const res = await dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${buildDatacatFolderReorderPath()}`, 'PUT', { folderIds: ids });
+    const res = await dcAccountJson(`${DC_EXT_BASE}${buildDatacatFolderReorderPath()}`, 'PUT', { folderIds: ids });
     if (!res?.ok) return { ok: false, error: res?.error || res?.reason || 'Could not save folder order' };
     const saved = Array.isArray(res.folderIds) ? res.folderIds.map(Number).filter(Number.isFinite) : ids;
     if (saved.length !== ids.length || !saved.every((id, i) => id === ids[i])) {
@@ -546,11 +466,11 @@ export async function reorderDatacatFolders(folderIds) {
 export async function setDatacatFolderMembership(folderId, characterId, member) {
     const path = buildDatacatFolderItemPath(folderId, characterId);
     if (!path) return { ok: false, error: 'Invalid DataCat folder or character id' };
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${path}`, member ? 'PUT' : 'DELETE');
+    return dcAccountJson(`${DC_EXT_BASE}${path}`, member ? 'PUT' : 'DELETE');
 }
 
 export async function fetchDatacatFolderCharacters(opts = {}) {
-    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${buildDatacatFolderCharactersPath(opts)}`);
+    return dcAccountJson(`${DC_EXT_BASE}${buildDatacatFolderCharactersPath(opts)}`);
 }
 export const DATACAT_EXTERNAL_PREINDEX_SOURCES = new Set(['hampter', 'meilisearch', 'saucepan']);
 
@@ -1251,7 +1171,7 @@ export function buildV2FromDatacat(character) {
             tags: tagNames,
             alternate_greetings: altGreetings,
             extensions: {
-                datacat: {
+                [PROVIDER_ID]: {
                     id: character.character_id || character.characterId,
                     sourceKind: character.primary_content_source_kind || null,
                     creatorId: character.creator_id || character.creatorId || null,
@@ -1324,7 +1244,7 @@ export function buildV2FromDownload(downloadData, character) {
             alternate_greetings: d.alternate_greetings || [],
             extensions: {
                 ...(d.extensions || {}),
-                datacat: {
+                [PROVIDER_ID]: {
                     id: character?.character_id || character?.characterId || null,
                     sourceKind: character?.primary_content_source_kind || null,
                     creatorId: character?.creator_id || character?.creatorId || null,
@@ -1355,7 +1275,7 @@ export function buildV2FromDownload(downloadData, character) {
 export async function submitExtraction(janitorUrl, { publicFeed = true, alwaysReextract = false, useAccount = true } = {}) {
     if (!_apiRequest) throw new Error('DataCat: apiRequest not bound');
     try {
-        const resp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-extract`, 'POST', { url: janitorUrl, publicFeed, alwaysReextract, useAccount });
+        const resp = await dcHelperRequest(`${DC_EXT_BASE}/dc-extract`, 'POST', { url: janitorUrl, publicFeed, alwaysReextract, useAccount });
         if (!resp.ok) {
             const errText = await resp.text();
             console.error('[DataCat] dc-extract error:', resp.status, errText.substring(0, 200));
@@ -1468,35 +1388,7 @@ export async function fetchHampterCharacters(opts = {}) {
     const url = `${HAMPTER_API_BASE}?${params}`;
     let data;
 
-    // Preferred transport: the userscript's GM_xmlhttpRequest carries cf_clearance, so it passes
-    // Cloudflare reliably; the direct fetch below only gets through when CF isn't challenging.
-    // The Bearer rides whichever transport runs (login is orthogonal to the CF gate).
-    // A transport failure falls through to the best-effort direct fetch below.
-    if (isJanitorBridgeAvailable()) {
-        let res = null;
-        try {
-            res = await janitorBridgeFetch(url, authToken, { allowClearance });
-        } catch { res = null; }
-        if (res) {
-            if (res.status === 401) {
-                const gated = new Error(authToken ? 'JanitorAI session expired' : 'JanitorAI requires signing in for this request');
-                gated.code = authToken ? 'HAMPTER_TOKEN_EXPIRED' : 'HAMPTER_LOGIN_REQUIRED';
-                gated.status = 401;
-                throw gated;
-            }
-            if (!res.ok) {
-                const blocked = new Error(classifyErrorPage(res.body, res.status) || `Hampter HTTP ${res.status}`);
-                blocked.code = 'HAMPTER_BLOCKED';
-                blocked.status = res.status;
-                throw blocked;
-            }
-            try {
-                data = JSON.parse(res.body);
-            } catch {
-                throw new Error(classifyErrorPage(res.body, res.status) || 'JanitorAI bridge returned non-JSON body');
-            }
-        }
-    }
+    // CL-only: janitor-bridge.js userscript transport, no Sigma equivalent
 
     if (data === undefined) {
         // Best-effort direct browser fetch. Hampter serves CORS *, but a cross-origin fetch cannot

@@ -148,7 +148,7 @@ export function buildDatacatYoursFolderFetchOptions(selection, common = {}) {
     return { ...common, folderId: value };
 }
 
-import CoreAPI from '../../core-api.js';
+import CoreAPI from '/modules/core-api.js';
 import {
     fetchDatacatFolders,
     fetchDatacatYoursStatus,
@@ -156,7 +156,7 @@ import {
     createDatacatFolder,
 } from './datacat-api.js';
 
-const { showToast, escapeHtml, getSetting } = CoreAPI;
+const { showToast, escapeHtml } = CoreAPI;
 
 let _hooks = {
     getMainSaved: () => false,

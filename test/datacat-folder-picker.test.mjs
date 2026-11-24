@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import {
+import './setup-browser-globals.mjs';
+const {
     filterPickerFolders,
     createDatacatFolderLoader,
     buildPickerModel,
@@ -11,8 +12,8 @@ import {
     buildDatacatYoursFolderFetchOptions,
     formatDatacatFolderSuccess,
     formatDatacatFolderRemoval,
-} from '../modules/providers/datacat/datacat-folder-picker.js';
-import { buildDatacatFolderCharactersPath } from '../modules/providers/datacat/datacat-api.js';
+} = await import('../client/datacat-folder-picker.js');
+const { buildDatacatFolderCharactersPath } = await import('../client/datacat-api.js');
 
 describe('filterPickerFolders', () => {
     it('drops reserved/system folders and keeps customs in API order', () => {
