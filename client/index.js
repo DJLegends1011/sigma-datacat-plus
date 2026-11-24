@@ -35,7 +35,7 @@ export default {
             icon: 'fa-solid fa-cat',
             iconUrl: 'https://datacat.run/catgif.gif',
             beta: true,
-            avatarTap: { imgId: 'datacatCharAvatar' },
+            avatarTap: { imgId: 'datacatCharAvatar', dataFull: true },
         });
 
         // Register preview, creator banner, and avatar-restore overlays via the Sigma overlay ledger

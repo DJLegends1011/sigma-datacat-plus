@@ -17,6 +17,7 @@ import {
 const DATACAT_BASE = 'https://datacat.run';
 export const T_SESSIONS = 'x_datacat_plus_sessions';
 const DC_PROXY_REDIRECT_LIMIT = 3;
+const DC_PROXY_MAX_BYTES = 8 * 1024 * 1024; // the largest DataCat JSON page seen is well under 1 MB
 
 function dcHeaders(token, options = {}) {
     return buildDataCatHeaders({
@@ -97,7 +98,7 @@ function requireDcAccount(req, res) {
         res.status(401).json({ error: 'No DataCat account session configured' });
         return null;
     }
-    return { token: session.accountToken, user: session.user, deviceToken: session.deviceToken };
+    return { token: session.accountToken, user: session.user };
 }
 
 async function readDcResponse(response) {
@@ -298,7 +299,6 @@ export function registerDataCatRoutes(router, ctx = null) {
                 const check = await testDcToken(session.anonToken, session.deviceToken);
                 if (check.ok) {
                     const result = { ok: true, cached: true, token: true };
-                    if (session.deviceToken) result.deviceToken = session.deviceToken;
                     return res.json(result);
                 }
             } catch { /* fall through to create new */ }
@@ -327,7 +327,7 @@ export function registerDataCatRoutes(router, ctx = null) {
                 });
                 console.log('[datacat-plus] DC anonymous session initialized');
                 // token: true, never the token itself: sessions stay server-side (the client only checks it is truthy)
-                return res.json({ ok: true, token: true, deviceToken: saved.deviceToken });
+                return res.json({ ok: true, token: true });
             }
 
             console.warn('[datacat-plus] DC identify returned unexpected shape:', JSON.stringify(data).slice(0, 300));
@@ -352,7 +352,6 @@ export function registerDataCatRoutes(router, ctx = null) {
         const saved = writeDcSession(req, patch);
         console.log('[datacat-plus] DC session token stored');
         const result = { ok: true };
-        if (saved.deviceToken) result.deviceToken = saved.deviceToken;
         res.json(result);
     });
 
@@ -365,14 +364,12 @@ export function registerDataCatRoutes(router, ctx = null) {
     router.get('/dc-session', (req, res) => {
         const session = readDcSession(req);
         const result = { active: !!session.anonToken };
-        if (session.deviceToken) result.deviceToken = session.deviceToken;
         res.json(result);
     });
 
     router.get('/dc-status', (req, res) => {
         const session = readDcSession(req);
         const result = { active: !!session.anonToken };
-        if (session.deviceToken) result.deviceToken = session.deviceToken;
         res.json(result);
     });
 
@@ -380,7 +377,6 @@ export function registerDataCatRoutes(router, ctx = null) {
         const session = readDcSession(req);
         if (!session.anonToken) {
             const result = { valid: false, reason: 'no token stored' };
-            if (session.deviceToken) result.deviceToken = session.deviceToken;
             return res.json(result);
         }
 
@@ -392,18 +388,15 @@ export function registerDataCatRoutes(router, ctx = null) {
                 const count = data?.totalCount || 0;
                 console.log(`[datacat-plus] DC validate: ${count} total chars available`);
                 const result = { valid: true, totalCount: count };
-                if (session.deviceToken) result.deviceToken = session.deviceToken;
                 res.json(result);
             } else {
                 console.warn(`[datacat-plus] DC validate failed: HTTP ${response.status}`);
                 const result = { valid: false, reason: formatDcError(response, data, rawText, 'DataCat validate') };
-                if (session.deviceToken) result.deviceToken = session.deviceToken;
                 res.json(result);
             }
         } catch (err) {
             console.error('[datacat-plus] DC validate error:', err.message);
             const result = { valid: false, reason: `Failed to reach DataCat: ${err.message}` };
-            if (session.deviceToken) result.deviceToken = session.deviceToken;
             res.json(result);
         }
     });
@@ -439,7 +432,7 @@ export function registerDataCatRoutes(router, ctx = null) {
                     console.warn('[datacat-plus] DC auth login account activation failed:', activation.reason);
                 }
                 const saved = writeDcSession(req, { accountToken, user: accountUser, deviceToken });
-                return res.json({ ok: true, deviceToken: saved.deviceToken, user: accountUser });
+                return res.json({ ok: true, user: accountUser });
             }
 
             const status = response.ok ? 401 : response.status || 401;
@@ -476,7 +469,7 @@ export function registerDataCatRoutes(router, ctx = null) {
             console.warn('[datacat-plus] DC auth set account activation failed:', activation.reason);
         }
         const saved = writeDcSession(req, { accountToken: value, user: verification.user, deviceToken });
-        return res.json({ ok: true, valid: true, user: verification.user, deviceToken: saved.deviceToken });
+        return res.json({ ok: true, valid: true, user: verification.user });
     });
 
     router.get('/dc-auth-status', async (req, res) => {
@@ -495,7 +488,7 @@ export function registerDataCatRoutes(router, ctx = null) {
                 console.warn('[datacat-plus] DC auth status account activation failed:', activation.reason);
             }
             const saved = writeDcSession(req, { user: verification.user, deviceToken });
-            return res.json({ valid: true, user: verification.user, deviceToken: saved.deviceToken });
+            return res.json({ valid: true, user: verification.user });
         }
 
         writeDcSession(req, { accountToken: null, user: null });
@@ -1004,15 +997,20 @@ export function registerDataCatRoutes(router, ctx = null) {
             const response = await fetchDcProxyTarget(targetUrl, active.token, session.deviceToken, ctx);
 
             const contentType = response.headers.get('content-type') || '';
-            res.status(response.status);
-            if (contentType) res.set('Content-Type', contentType);
-
-            if (contentType.includes('application/json')) {
-                res.send(await response.text());
-            } else {
-                const buffer = Buffer.from(await response.arrayBuffer());
-                res.send(buffer);
+            // capped, and sandboxed so an upstream HTML/SVG answer never runs same-origin in Sigma
+            const declared = Number(response.headers.get('content-length'));
+            if (declared > DC_PROXY_MAX_BYTES) {
+                return res.status(502).json({ error: `DataCat answered ${declared} bytes, over the ${DC_PROXY_MAX_BYTES} byte limit` });
             }
+            const buffer = Buffer.from(await response.arrayBuffer());
+            if (buffer.length > DC_PROXY_MAX_BYTES) {
+                return res.status(502).json({ error: `DataCat answered ${buffer.length} bytes, over the ${DC_PROXY_MAX_BYTES} byte limit` });
+            }
+            res.status(response.status);
+            res.set('Content-Security-Policy', 'sandbox');
+            res.set('X-Content-Type-Options', 'nosniff');
+            if (contentType) res.set('Content-Type', contentType);
+            res.send(buffer);
         } catch (err) {
             console.error('[datacat-plus] DC proxy error:', err.message);
             res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });

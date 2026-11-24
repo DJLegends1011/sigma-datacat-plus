@@ -101,17 +101,8 @@ class DatacatProvider extends ProviderBase {
 
     get hasView() { return true; }
 
-    renderFilterBar() { return datacatBrowseView.renderFilterBar(); }
-    renderView() { return datacatBrowseView.renderView(); }
-    renderModals() { return datacatBrowseView.renderModals(); }
-
-    async activate(container, options = {}) {
-        datacatBrowseView.activate(container, options);
-    }
-
-    deactivate() {
-        datacatBrowseView.deactivate();
-    }
+    // CL-only: renderFilterBar/renderView/renderModals/activate/deactivate delegations removed;
+    // Sigma's registry calls the browse view's own members.
 
     // ── Character Linking ───────────────────────────────────
 
@@ -534,12 +525,6 @@ class DatacatProvider extends ProviderBase {
             console.error(`[DatacatProvider] importCharacter failed for ${identifier}:`, error);
             return { success: false, error: error.message };
         }
-    }
-
-    // ── Settings ────────────────────────────────────────────
-
-    getSettings() {
-        return [];
     }
 
     // ── Bulk Linking ────────────────────────────────────────

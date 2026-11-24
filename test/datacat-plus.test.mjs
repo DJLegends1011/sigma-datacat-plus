@@ -115,10 +115,10 @@ test('GET /dc-session returns JSON and isolates state across accounts', async ()
         deviceToken: 'alice-device-token',
     });
     assert.equal(setAlice.status, 200);
-    assert.deepEqual(setAlice.body, { ok: true, deviceToken: 'alice-device-token' });
+    assert.deepEqual(setAlice.body, { ok: true });
 
     const afterAlice = await aliceExt('/dc-session');
-    assert.deepEqual(afterAlice.body, { active: true, deviceToken: 'alice-device-token' });
+    assert.deepEqual(afterAlice.body, { active: true });
 
     // Bob must not see Alice's anonymous or device token
     const afterBob = await bobExt('/dc-session');
@@ -222,4 +222,23 @@ test('HTML error pages from DataCat surface DataCat status and <title> without c
     const folders = await aliceExt('/dc-folders');
     assert.equal(folders.status, 403);
     assert.match(folders.body.error, /DataCat returned HTTP 403: Just a moment/);
+});
+
+test('/dc-proxy answers are sandboxed and size-capped; no route echoes a token', async () => {
+    const aliceExt = alice.ext('datacat-plus');
+    datacatResponder = (url) => {
+        if (url.includes('/api/characters/recent-public')) return textResp('<script>alert(1)</script>', 200);
+        if (url.includes('/api/tags/faceted')) return jsonResp({ big: 'x'.repeat(9 * 1024 * 1024) });
+        return jsonResp({ error: 'unexpected' }, 500);
+    };
+    const html = await alice.apiRequest('/ext/datacat-plus/dc-proxy/api/characters/recent-public?limit=1');
+    assert.equal(html.status, 200);
+    assert.equal(html.headers.get('content-security-policy'), 'sandbox');
+    const big = await aliceExt('/dc-proxy/api/tags/faceted');
+    assert.equal(big.status, 502);
+    assert.match(big.body.error, /byte limit/);
+    for (const path of ['/dc-session', '/dc-auth-status', '/dc-status']) {
+        const r = await aliceExt(path);
+        assert.doesNotMatch(JSON.stringify(r.body ?? ''), /secret-acct-token|alice-anon-token|alice-device-token/);
+    }
 });
