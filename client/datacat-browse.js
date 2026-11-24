@@ -5,7 +5,7 @@
 //   - JanitorAI MeiliSearch: text search + sort (activated via janny_* sort modes)
 //   - Extraction: cloud-browser extraction for JanitorAI-only characters
 
-import { BrowseView } from '/modules/providers/browse-view.js';
+import { BrowseView, renderViewToggle, updateNsfwToggleButton, renderFeatureFilterItems, setFilterCount } from '/modules/providers/browse-view.js';
 import CoreAPI from '/modules/core-api.js';
 import { IMG_PLACEHOLDER, formatNumber, BROWSE_PURIFY_CONFIG, skeletonLines, deferRender, deferCall, isMobileMode, renderBrowseError } from '/modules/providers/provider-utils.js';
 import { PROVIDER_ID } from './datacat-id.js';
@@ -244,6 +244,21 @@ function isNsfw(hit) {
 function isCharInLocalLibrary(dcChar) {
     return view ? view.isHitInLibrary(dcChar) : false;
 }
+
+// The Features dropdown rows, drawn by Sigma's renderFeatureFilterItems so the markup matches the
+// native providers; the checkboxes keep driving this view's own filter variables (wired by id).
+// CL-only: the Hide Saucepan row, no Saucepan source in Sigma.
+const DATACAT_FEATURE_ROWS = [
+    { key: 'onlyYours', id: 'datacatFilterOnlyYours', section: 'personal', icon: 'fa-heart', iconStyle: 'color: #e74c3c;', label: 'Collected' },
+    { key: 'hideOwned', id: 'datacatFilterHideOwned', section: 'library', icon: 'fa-check', label: 'Hide Owned Characters' },
+    { key: 'hidePossible', id: 'datacatFilterHidePossible', section: 'library', icon: 'fa-check', iconStyle: 'color: var(--cl-possible-match);', label: 'Hide Possible Matches' },
+    { key: 'hideJanitor', id: 'datacatFilterHideJanitor', section: 'source', icon: 'fa-cat', label: 'Hide JanitorAI' },
+];
+const DATACAT_FILTER_SECTIONS = [
+    { key: 'personal', title: 'Personal <span style="font-size: 0.8em; opacity: 0.6;">(requires login)</span>:' },
+    { key: 'library', title: 'Library:' },
+    { key: 'source', title: 'Source:', wrapId: 'datacatFilterSourceSection', noHr: true },
+];
 
 function isCharPossibleMatchObj(c) {
     if (isCharInLocalLibrary(c)) return false;
@@ -537,6 +552,9 @@ function observeNewCards() {
 // GRID RENDERING
 // ========================================
 
+const TOP_UP_DELAY_MS = 700;
+let datacatAccountedVisible = 0; // visible cards this load sequence has shown or held back
+let datacatHoldingRender = false; // a top-up chain is filling the first screen; the skeleton stays
 let datacatAutoTopUps = 0; // chained top-up fetches since the last user-initiated load
 let datacatTopUpVisible = 0; // visible cards accumulated across those chained fetches
 
@@ -545,6 +563,14 @@ let datacatTopUpVisible = 0; // visible cards accumulated across those chained f
 // recents) have no pre-increment: their offset advances at response time by the rows the server
 // actually returned, because datacat clamps limit server-side (asked 80, returns 50) and a fixed
 // PAGE_SIZE stride was silently skipping the 30 rows between clamp and stride on every page.
+// Whether this load will be followed by a chained top-up fetch (same rule as the chain itself)
+function willTopUp(visibleNew, append) {
+    return Number.isFinite(visibleNew) && delegatesInitialized
+        && datacatViewMode === 'browse' && datacatHasMore
+        && (append || datacatCharacters.length > 0)
+        && datacatTopUpVisible + visibleNew < PAGE_SIZE && datacatAutoTopUps < 3;
+}
+
 function advanceDatacatPage() {
     if (datacatBrowseMode === 'creator') {
         // response-time offset advance
@@ -565,15 +591,7 @@ function advanceDatacatPage() {
     return loadCharacters(true);
 }
 
-function renderGrid(characters, append = false) {
-    const grid = document.getElementById('datacatGrid');
-    if (!grid) return;
-
-    if (!append) {
-        grid.innerHTML = '';
-        datacatGridRenderedCount = 0;
-    }
-
+function filterDatacatCharacters(characters) {
     let filtered = datacatNsfwEnabled
         ? characters
         : characters.filter(c => !isNsfw(c));
@@ -611,13 +629,31 @@ function renderGrid(characters, append = false) {
             return !lowerExclude.some(et => names.includes(et));
         });
     }
+    return filtered;
+}
 
+// What the grid shows of `characters` after the client-side filters (NSFW, features, excludes)
+function visibleDatacatCharacters(characters) {
+    return filterDatacatCharacters(characters);
+}
 
+function renderGrid(characters, append = false) {
+    const grid = document.getElementById('datacatGrid');
+    if (!grid) return;
+
+    // a held first page (see loadCharacters) leaves the skeleton up: clear it on the first real render
+    if (!append || datacatGridRenderedCount === 0) {
+        grid.innerHTML = '';
+        datacatGridRenderedCount = 0;
+    }
+
+    const filtered = filterDatacatCharacters(characters);
 
     const startIdx = append ? datacatGridRenderedCount : 0;
     const html = filtered.slice(startIdx).map(c => createDatacatCard(c)).join('');
     grid.insertAdjacentHTML('beforeend', html);
     datacatGridRenderedCount = filtered.length;
+    datacatAccountedVisible = filtered.length;
 
     observeNewCards();
     updateLoadMore();
@@ -633,7 +669,7 @@ function updateLoadMore() {
 
 async function loadCharacters(append = false) {
     if (append && datacatIsLoading) return;
-    if (!append) { datacatAutoTopUps = 0; datacatTopUpVisible = 0; }
+    if (!append) { datacatAutoTopUps = 0; datacatTopUpVisible = 0; datacatGridRenderedCount = 0; datacatAccountedVisible = 0; datacatHoldingRender = false; }
     const thisToken = ++datacatLoadToken;
     datacatIsLoading = true;
     let visibleNew = Infinity; // error paths must never trigger the top-up chain
@@ -810,9 +846,15 @@ async function loadCharacters(append = false) {
             datacatHasMore = list.length >= activeLimit;
         }
 
-        const renderedBefore = append ? datacatGridRenderedCount : 0;
-        renderGrid(datacatCharacters, append);
-        visibleNew = datacatGridRenderedCount - renderedBefore;
+        // counted against what earlier loads of this sequence already showed or held
+        const renderedBefore = append ? datacatAccountedVisible : 0;
+        const visibleNow = visibleDatacatCharacters(datacatCharacters).length;
+        visibleNew = visibleNow - renderedBefore;
+        datacatAccountedVisible = visibleNow;
+        // Hold the render while a top-up chain is still filling the first screen, so a page that the
+        // filters thin to a card or two doesn't paint cards one at a time; the skeleton stays up.
+        datacatHoldingRender = willTopUp(visibleNew, append);
+        if (!datacatHoldingRender) renderGrid(datacatCharacters, append);
 
         if (!append && datacatCharacters.length === 0) {
             const emptyMsg = datacatBrowseMode === 'creator'
@@ -830,6 +872,20 @@ async function loadCharacters(append = false) {
 
     } catch (err) {
         if (thisToken !== datacatLoadToken) return;
+        // a chained top-up failed: show what the chain already gathered instead of the skeleton
+        const chained = datacatAutoTopUps > 0;
+        if (chained) {
+            datacatHoldingRender = false;
+            renderGrid(datacatCharacters, true);
+        }
+        if (append && err?.status === 429) {
+            // DataCat rate-limits fast paging (RECENT_PUBLIC_PAGINATION_RATE_LIMITED): stop quietly,
+            // keep Load More so the user can ask again once it has cooled down
+            console.warn('[DatacatBrowse] DataCat rate-limited paging:', err.message);
+            if (!chained) showToast('DataCat is limiting how fast pages load. Wait a few seconds, then load more.', 'info');
+            updateLoadMore();
+            return;
+        }
         console.error('[DatacatBrowse] Load error:', err);
         const isHampterBlocked = err?.code === 'HAMPTER_BLOCKED' && isHampterSortMode(datacatSortMode);
         const isHampterLoginGated = err?.code === 'HAMPTER_LOGIN_REQUIRED' && isHampterSortMode(datacatSortMode);
@@ -921,13 +977,17 @@ async function loadCharacters(append = false) {
     if (Number.isFinite(visibleNew) && thisToken === datacatLoadToken && delegatesInitialized
         && datacatViewMode === 'browse' && datacatHasMore
         && (append || datacatCharacters.length > 0)) {
-        datacatTopUpVisible += visibleNew;
-        if (datacatTopUpVisible < PAGE_SIZE && datacatAutoTopUps < 3) {
+        if (willTopUp(visibleNew, append)) {
+            datacatTopUpVisible += visibleNew;
             datacatAutoTopUps++;
             // Chained fetches bypass _triggerLoadMore, so drive the loading bar ourselves
             // (the next render's updateLoadMore restores it to hidden/end)
             datacatBrowseView._setScrollIndicator('loading');
-            advanceDatacatPage();
+            // spaced out: DataCat now answers 429 to back-to-back recent-public pages
+            const token = datacatLoadToken;
+            setTimeout(() => { if (token === datacatLoadToken) advanceDatacatPage(); }, TOP_UP_DELAY_MS);
+        } else {
+            datacatTopUpVisible += visibleNew;
         }
     }
 }
@@ -1199,17 +1259,17 @@ function renderJannyTagsList(filter = '') {
 // ========================================
 
 const FRESH_SORT_LABELS = [
-    { value: 'fresh', label: '🌟 Freshest' },
-    { value: 'score', label: '⭐ Score' },
-    { value: 'chat_count', label: '💬 Chat Count' },
-    { value: 'messages_per_chat', label: '📊 MSG/Chat' },
-    { value: 'first_published', label: '📅 First Published' },
+    { value: 'fresh', label: 'Freshest', icon: 'fa-solid fa-seedling' },
+    { value: 'score', label: 'Score', icon: 'fa-solid fa-star' },
+    { value: 'chat_count', label: 'Chat Count', icon: 'fa-solid fa-comments' },
+    { value: 'messages_per_chat', label: 'MSG/Chat', icon: 'fa-solid fa-chart-simple' },
+    { value: 'first_published', label: 'First Published', icon: 'fa-solid fa-calendar-day' },
 ];
 
 const CREATOR_SORT_OPTIONS = [
-    { value: 'chat_count', label: '💬 Most Messages' },
-    { value: 'newest', label: '🆕 Newest' },
-    { value: 'oldest', label: '🕐 Oldest' },
+    { value: 'chat_count', label: 'Most Messages', icon: 'fa-solid fa-comments' },
+    { value: 'newest', label: 'Newest', icon: 'fa-solid fa-calendar-plus' },
+    { value: 'oldest', label: 'Oldest', icon: 'fa-solid fa-hourglass' },
 ];
 
 function isJannySortMode(mode) {
@@ -1230,19 +1290,19 @@ function parseSortMode(mode) {
 }
 
 const JANNY_SORT_OPTIONS = [
-    { value: 'janny_newest', label: '🆕 Newest' },
-    { value: 'janny_oldest', label: '🕐 Oldest' },
-    { value: 'janny_tokens_desc', label: '📊 Most Tokens' },
-    { value: 'janny_tokens_asc', label: '📊 Least Tokens' },
-    { value: 'janny_relevant', label: '🔍 Relevance' },
+    { value: 'janny_newest', label: 'Newest', icon: 'fa-solid fa-calendar-plus' },
+    { value: 'janny_oldest', label: 'Oldest', icon: 'fa-solid fa-hourglass' },
+    { value: 'janny_tokens_desc', label: 'Most Tokens', icon: 'fa-solid fa-arrow-down-wide-short' },
+    { value: 'janny_tokens_asc', label: 'Least Tokens', icon: 'fa-solid fa-arrow-up-short-wide' },
+    { value: 'janny_relevant', label: 'Relevance', icon: 'fa-solid fa-magnifying-glass' },
 ];
 
 const HAMPTER_SORT_OPTIONS = [
-    { value: 'hampter_latest', label: '🆕 Latest' },
-    { value: 'hampter_trending', label: '🔥 Trending' },
-    { value: 'hampter_trending24', label: '🔥 Trending (24h)' },
-    { value: 'hampter_popular', label: '👑 Popular' },
-    { value: 'hampter_relevance', label: '🔍 Relevance' },
+    { value: 'hampter_latest', label: 'Latest', icon: 'fa-solid fa-calendar-plus' },
+    { value: 'hampter_trending', label: 'Trending', icon: 'fa-solid fa-fire' },
+    { value: 'hampter_trending24', label: 'Trending (24h)', icon: 'fa-solid fa-fire-flame-curved' },
+    { value: 'hampter_popular', label: 'Popular', icon: 'fa-solid fa-crown' },
+    { value: 'hampter_relevance', label: 'Relevance', icon: 'fa-solid fa-magnifying-glass' },
 ];
 
 // Derived from the same lists the dropdown is built from, so a retired sort cannot linger here.
@@ -1256,26 +1316,26 @@ function isKnownSortMode(mode) {
 }
 
 function buildSortOptionsHtml(selected) {
-    let html = `<option value="recent" ${selected === 'recent' ? 'selected' : ''}>🆕 Recent</option>`;
+    let html = `<option value="recent" data-icon="fa-solid fa-clock-rotate-left" ${selected === 'recent' ? 'selected' : ''}>Recent</option>`;
     html += '<optgroup label="Last 24 Hours">';
     for (const o of FRESH_SORT_LABELS) {
         const val = `${o.value}_24h`;
-        html += `<option value="${val}" ${val === selected ? 'selected' : ''}>${o.label}</option>`;
+        html += `<option value="${val}" data-icon="${o.icon}" ${val === selected ? 'selected' : ''}>${o.label}</option>`;
     }
     html += '</optgroup><optgroup label="This Week">';
     for (const o of FRESH_SORT_LABELS) {
         const val = `${o.value}_week`;
-        html += `<option value="${val}" ${val === selected ? 'selected' : ''}>${o.label}</option>`;
+        html += `<option value="${val}" data-icon="${o.icon}" ${val === selected ? 'selected' : ''}>${o.label}</option>`;
     }
     html += '</optgroup>';
     html += '<optgroup label="JanitorAI (Hampter)">';
     for (const o of HAMPTER_SORT_OPTIONS) {
-        html += `<option value="${o.value}" ${o.value === selected ? 'selected' : ''}>${o.label}</option>`;
+        html += `<option value="${o.value}" data-icon="${o.icon}" ${o.value === selected ? 'selected' : ''}>${o.label}</option>`;
     }
     html += '</optgroup>';
     html += '<optgroup label="JanitorAI (MeiliSearch)">';
     for (const o of JANNY_SORT_OPTIONS) {
-        html += `<option value="${o.value}" ${o.value === selected ? 'selected' : ''}>${o.label}</option>`;
+        html += `<option value="${o.value}" data-icon="${o.icon}" ${o.value === selected ? 'selected' : ''}>${o.label}</option>`;
     }
     html += '</optgroup>';
     return html;
@@ -1288,7 +1348,7 @@ function updateSortOptions() {
     if (isCreator) {
         const current = datacatCreatorSortMode;
         el.innerHTML = CREATOR_SORT_OPTIONS.map(o =>
-            `<option value="${o.value}" ${o.value === current ? 'selected' : ''}>${o.label}</option>`
+            `<option value="${o.value}" data-icon="${o.icon}" ${o.value === current ? 'selected' : ''}>${o.label}</option>`
         ).join('');
     } else {
         el.innerHTML = buildSortOptionsHtml(datacatSortMode);
@@ -2192,7 +2252,7 @@ function updateFollowButton(creatorId, source = datacatCreatorSource) {
 async function switchDatacatViewMode(mode) {
     datacatViewMode = mode;
 
-    document.querySelectorAll('.datacat-view-btn').forEach(btn => {
+    document.querySelectorAll('.browse-view-btn[data-datacat-view]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.datacatView === mode);
     });
 
@@ -3315,28 +3375,13 @@ function markCardAsImported(charId) {
 // ========================================
 
 function updateNsfwToggle() {
-    const btn = document.getElementById('datacatNsfwToggle');
-    if (!btn) return;
-
-    if (datacatNsfwEnabled) {
-        btn.classList.add('active');
-        btn.innerHTML = '<i class="fa-solid fa-fire"></i> <span>NSFW On</span>';
-        btn.title = 'NSFW content enabled. Click to show SFW only';
-    } else {
-        btn.classList.remove('active');
-        btn.innerHTML = '<i class="fa-solid fa-shield-halved"></i> <span>SFW Only</span>';
-        btn.title = 'Showing SFW only. Click to include NSFW';
-    }
+    updateNsfwToggleButton('datacatNsfwToggle', datacatNsfwEnabled);
 }
 
 function updateDatacatFiltersButtonState() {
-    const btn = document.getElementById('datacatFiltersBtn');
-    if (!btn) return;
-    const count = [datacatFilterHideOwned, datacatFilterHidePossible, datacatFilterOnlyYours, datacatFilterHideJanitor, datacatFilterHideSaucepan].filter(Boolean).length;
-    btn.classList.toggle('has-filters', count > 0);
-    btn.innerHTML = count > 0
-        ? `<i class="fa-solid fa-sliders"></i> Features (${count})`
-        : '<i class="fa-solid fa-sliders"></i> <span>Features</span>';
+    const count = [datacatFilterHideOwned, datacatFilterHidePossible, datacatFilterOnlyYours, datacatFilterHideJanitor].filter(Boolean).length;
+    // Sigma's count badge, like every native Features button (no relabelled button text)
+    setFilterCount(document.getElementById('datacatFiltersBtn'), 'Features', count);
 }
 
 function renderDatacatYoursFolderOptions() {
@@ -3495,10 +3540,14 @@ function initDatacatView() {
         datacatNsfwEnabled = !datacatNsfwEnabled;
         setDcSetting('datacatNsfw', datacatNsfwEnabled);
         updateNsfwToggle();
+        // like the native providers: the grid goes to the loading state and refills, rather than
+        // re-filtering in place (with SFW on, most of a DataCat page is hidden and the refill tops up)
         if (datacatViewMode === 'following') {
-            renderFollowing();
+            const g = document.getElementById('datacatFollowingGrid');
+            if (g) renderSkeletonGrid(g);
+            requestAnimationFrame(() => renderFollowing());
         } else {
-            renderGrid(datacatCharacters, false);
+            loadCharacters(false);
         }
     });
     updateNsfwToggle();
@@ -3508,7 +3557,7 @@ function initDatacatView() {
     // Filters dropdown toggle
     on('datacatFiltersBtn', 'click', (e) => {
         e.stopPropagation();
-        CoreAPI.closeAllTopbarDropdowns();
+        CoreAPI.closeAllTopbarDropdowns('datacatFiltersDropdown');
         document.getElementById('datacatTagsDropdown')?.classList.add('hidden');
         document.getElementById('datacatFiltersDropdown')?.classList.toggle('hidden');
     });
@@ -3519,7 +3568,6 @@ function initDatacatView() {
         { id: 'datacatFilterHidePossible', setter: (v) => datacatFilterHidePossible = v, getter: () => datacatFilterHidePossible },
         { id: 'datacatFilterOnlyYours', setter: (v) => datacatFilterOnlyYours = v, getter: () => datacatFilterOnlyYours },
         { id: 'datacatFilterHideJanitor', setter: (v) => datacatFilterHideJanitor = v, getter: () => datacatFilterHideJanitor },
-        { id: 'datacatFilterHideSaucepan', setter: (v) => datacatFilterHideSaucepan = v, getter: () => datacatFilterHideSaucepan },
     ];
     dcFilterCheckboxes.forEach(({ id, getter }) => {
         const cb = document.getElementById(id);
@@ -3614,7 +3662,9 @@ function initDatacatView() {
     // Clear creator filter
     on('datacatClearCreatorBtn', 'click', () => clearCreatorFilter());
     // Tags dropdown toggle
-    on('datacatTagsBtn', 'click', () => {
+    on('datacatTagsBtn', 'click', (e) => {
+        e.stopPropagation();
+        CoreAPI.closeAllTopbarDropdowns('datacatTagsDropdown');
         document.getElementById('datacatFiltersDropdown')?.classList.add('hidden');
         const dropdown = document.getElementById('datacatTagsDropdown');
         if (!dropdown) return;
@@ -3670,7 +3720,7 @@ function initDatacatView() {
     ]);
 
     // View mode toggle (Browse / Following)
-    document.querySelectorAll('.datacat-view-btn').forEach(btn => {
+    document.querySelectorAll('.browse-view-btn[data-datacat-view]').forEach(btn => {
         btn.addEventListener('click', () => {
             const mode = btn.dataset.datacatView;
             if (mode && mode !== datacatViewMode) {
@@ -4013,8 +4063,8 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             filters: 'datacatFiltersBtn',
             nsfw: 'datacatNsfwToggle',
             refresh: 'datacatRefreshBtn',
-            modeBrowseSelector: '.datacat-view-btn[data-datacat-view="browse"]',
-            modeFollowSelector: '.datacat-view-btn[data-datacat-view="following"]',
+            modeBrowseSelector: '.browse-view-btn[data-datacat-view="browse"]',
+            modeFollowSelector: '.browse-view-btn[data-datacat-view="following"]',
         };
     }
 
@@ -4023,14 +4073,10 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
     renderFilterBar() {
         return `
             <!-- Mode Toggle -->
-            <div class="chub-view-toggle">
-                <button class="datacat-view-btn active" data-datacat-view="browse" title="Browse all characters">
-                    <i class="fa-solid fa-compass"></i> <span>Browse</span>
-                </button>
-                <button class="datacat-view-btn" data-datacat-view="following" title="Characters from creators you follow">
-                    <i class="fa-solid fa-users"></i> <span>Following</span>
-                </button>
-            </div>
+            ${renderViewToggle('datacat-view', [
+                { value: 'browse', icon: 'fa-compass', label: 'Browse', title: 'Browse all characters', active: datacatViewMode !== 'following' },
+                { value: 'following', icon: 'fa-users', label: 'Following', title: 'Characters from creators you follow' },
+            ])}
 
             <!-- Sort -->
             <div id="datacatSortContainer" class="browse-sort-container">
@@ -4038,11 +4084,11 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                     ${buildSortOptionsHtml(datacatSortMode)}
                 </select>
                 <select id="datacatFollowingSortSelect" class="glass-select hidden" title="Sort following timeline">
-                    <option value="newest" selected>🆕 Newest Created</option>
-                    <option value="oldest">🕐 Oldest First</option>
-                    <option value="name_asc">📝 Name A-Z</option>
-                    <option value="name_desc">📝 Name Z-A</option>
-                    <option value="chat_count">💬 Most Messages</option>
+                    <option value="newest" data-icon="fa-solid fa-calendar-plus" selected>Newest Created</option>
+                    <option value="oldest" data-icon="fa-solid fa-hourglass">Oldest First</option>
+                    <option value="name_asc" data-icon="fa-solid fa-arrow-down-a-z">Name A-Z</option>
+                    <option value="name_desc" data-icon="fa-solid fa-arrow-up-z-a">Name Z-A</option>
+                    <option value="chat_count" data-icon="fa-solid fa-comments">Most Messages</option>
                 </select>
             </div>
 
@@ -4067,17 +4113,8 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                 <button id="datacatFiltersBtn" class="glass-btn" title="Filter by character features">
                     <i class="fa-solid fa-sliders"></i> <span>Features</span>
                 </button>
-                <div id="datacatFiltersDropdown" class="dropdown-menu browse-features-dropdown hidden" style="width: 240px;">
-                    <div class="dropdown-section-title">Personal <span style="font-size: 0.8em; opacity: 0.6;">(requires login)</span>:</div>
-                    <label class="filter-checkbox"><input type="checkbox" id="datacatFilterOnlyYours"> <i class="fa-solid fa-heart" style="color: #e74c3c;"></i> Collected</label>
-                    <hr style="margin: 8px 0; border-color: var(--glass-border);">
-                    <div class="dropdown-section-title">Library:</div>
-                    <label class="filter-checkbox"><input type="checkbox" id="datacatFilterHideOwned"> <i class="fa-solid fa-check"></i> Hide Owned Characters</label>
-                    <label class="filter-checkbox"><input type="checkbox" id="datacatFilterHidePossible"> <i class="fa-solid fa-check" style="color: #f0a500;"></i> Hide Possible Matches</label>                    <div id="datacatFilterSourceSection">
-                        <div class="dropdown-section-title">Source:</div>
-                        <label class="filter-checkbox"><input type="checkbox" id="datacatFilterHideJanitor"> <i class="fa-solid fa-cat"></i> Hide JanitorAI</label>
-                        <label class="filter-checkbox"><input type="checkbox" id="datacatFilterHideSaucepan"> <i class="fa-solid fa-bowl-food"></i> Hide Saucepan</label>
-                    </div>
+                <div id="datacatFiltersDropdown" class="dropdown-menu browse-features-dropdown hidden">
+                    ${renderFeatureFilterItems(DATACAT_FILTER_SECTIONS, DATACAT_FEATURE_ROWS)}
                 </div>
             </div>
 
@@ -4129,7 +4166,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                     </div>
                     <div class="browse-author-banner-actions">
                         <select id="datacatCreatorSortSelect" class="glass-select" title="Sort creator's characters">
-                            ${CREATOR_SORT_OPTIONS.map(o => `<option value="${o.value}">${o.label}</option>`).join('')}
+                            ${CREATOR_SORT_OPTIONS.map(o => `<option value="${o.value}" data-icon="${o.icon}">${o.label}</option>`).join('')}
                         </select>
                         <button id="datacatFollowCreatorBtn" class="glass-btn" title="Follow this creator" style="display: none;">
                             <i class="fa-regular fa-heart"></i> <span>Follow</span>

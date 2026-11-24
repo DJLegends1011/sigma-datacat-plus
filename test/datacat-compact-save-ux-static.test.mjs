@@ -49,10 +49,10 @@ test('DataCat folder mutations own one destination notification', () => {
 });
 
 test('DataCat Features follows maintainer Personal and Library grouping', () => {
-    assert.match(
-        browse,
-        /Personal <span[^>]*>\(requires login\)<\/span>:[\s\S]{0,500}id="datacatFilterOnlyYours"[\s\S]{0,180}fa-solid fa-heart[\s\S]{0,120}Collected[\s\S]{0,500}<div class="dropdown-section-title">Library:<\/div>/,
-    );
+    // the rows are a table drawn by Sigma's renderFeatureFilterItems: Personal (Collected) comes before Library
+    assert.match(browse, /\{ key: 'personal', title: 'Personal <span[^>]*>\(requires login\)<\/span>:' \},\s*\{ key: 'library', title: 'Library:' \}/);
+    assert.match(browse, /\{ key: 'onlyYours', id: 'datacatFilterOnlyYours', section: 'personal', icon: 'fa-heart'[^}]*label: 'Collected' \}/);
+    assert.match(browse, /renderFeatureFilterItems\(DATACAT_FILTER_SECTIONS, DATACAT_FEATURE_ROWS\)/);
     assert.doesNotMatch(browse, /id="datacatFilterOnlyYours"[^>]*>[\s\S]{0,220}Only DataCat Yours<\/label>/);
 });
 
