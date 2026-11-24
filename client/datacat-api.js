@@ -1,0 +1,1581 @@
+// Shared DataCat API utilities - used by datacat-provider.js and datacat-browse.js
+//
+// Sections: Network, Metadata, Browse/Search, Tags, V2 Card Builder, Extraction, MeiliSearch
+
+import CoreAPI from '../../core-api.js';
+import { CL_HELPER_PLUGIN_BASE, slugify, stripHtml, readJsonClassified, classifyErrorPage } from '../provider-utils.js';
+import { meiliMultiSearch, TAG_MAP as JANNY_TAG_MAP } from '../janny/janny-api.js';
+import { isJanitorBridgeAvailable, janitorBridgeFetch } from '../janitor-bridge.js';
+
+export { slugify, stripHtml, JANNY_TAG_MAP };
+
+/**
+ * Decode common HTML entities. JanitorAI's listing endpoints (Meili + Hampter)
+ * return creator-notes HTML escaped (&lt;p&gt;...&lt;/p&gt;) rather than raw,
+ * so consumers expecting real HTML must decode first.
+ */
+function decodeHtmlEntities(s) {
+    if (!s || typeof s !== 'string') return s || '';
+    if (s.indexOf('&') === -1) return s;
+    return s
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+        .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/&amp;/g, '&');
+}
+
+// ========================================
+// CONSTANTS
+// ========================================
+
+export const DATACAT_API_BASE = 'https://datacat.run';
+
+// DataCat aggregates from multiple sources. Each has its own avatar URL convention:
+//   - JanitorAI: bare filename, served from ella.janitorai.com
+//   - Saucepan: full https URL (cdn.saucepan.ai/...) embedded in the avatar field
+// Future sources should be added here. Use resolveDatacatAvatarUrl() to get a usable URL.
+export const DATACAT_JANITOR_IMAGE_BASE = 'https://ella.janitorai.com/bot-avatars/';
+
+/**
+ * Resolve a character's avatar URL based on its source.
+ * Saucepan and other future sources embed full URLs in the avatar field;
+ * JanitorAI uses bare filenames that need the ella.janitorai.com prefix.
+ * @param {Object} hit - DataCat character object (listing or detail)
+ * @returns {string|null} Full URL or null if no avatar
+ */
+export function resolveDatacatAvatarUrl(hit, opts = {}) {
+    // preferOriginal (import / avatar viewer): hit.avatar on datacat-native rows is their 640px
+    // card variant, but the detail payload's embedded V2 json still points at the untouched
+    // janitorai original (1024px+, CORS-open) and the hero variant is 768px. The absolute-URL
+    // guard on the v2 candidates skips ST's 'none' convention and bare filenames. Listing rows
+    // carry none of the extra fields and fall through to hit.avatar, ie. todays behavior.
+    const absOnly = (c) => (typeof c === 'string' && /^https?:\/\//i.test(c) ? c : null);
+    const candidates = opts.preferOriginal
+        ? [
+            absOnly(hit?.chara_card_v2_json?.data?.avatar),
+            absOnly(hit?.content_variants?.[0]?.content?.chara_card_v2_json?.data?.avatar),
+            hit?.avatar_variant_urls?.hero || hit?.avatarVariantUrls?.hero,
+            hit?.avatar,
+        ]
+        : [hit?.avatar];
+    for (const avatar of candidates) {
+        if (!avatar || typeof avatar !== 'string') continue;
+        let url = /^https?:\/\//i.test(avatar) ? avatar : `${DATACAT_JANITOR_IMAGE_BASE}${avatar}`;
+        const safety = CoreAPI.isUrlSafeForDownload(url);
+        if (!safety.ok) continue;
+        // Grid cards pass a width to pull a thumbnail: janitorai's raw bot-avatars are full-size
+        // originals, so decoding them into ~150px card slots is what makes hampter grids chug.
+        // datacat-native rows already resolve to an optimized card.webp variant, so skip them.
+        if (opts.width && /(^|\.)janitorai\.com$/i.test((() => { try { return new URL(url).hostname; } catch { return ''; } })())) {
+            url += (url.includes('?') ? '&' : '?') + `width=${opts.width}`;
+        }
+        return url;
+    }
+    return null;
+}
+
+// Minimum token threshold for quality filtering (matches DataCat's own frontend default)
+export const MIN_TOTAL_TOKENS = 889;
+
+// ========================================
+// NETWORK
+// ========================================
+
+const DC_PROXY_BASE = `${CL_HELPER_PLUGIN_BASE}/dc-proxy`;
+
+let _apiRequest = null;
+let _getSavedToken = null;
+let _getSavedAccountToken = null;
+let _getSavedDeviceToken = null;
+let _getDatacatClientId = null;
+let _bootstrapInFlight = null;
+
+/**
+ * Bind the CoreAPI.apiRequest function for use in proxied requests.
+ * Called once from the provider's init().
+ */
+export function setApiRequest(fn) { _apiRequest = fn; }
+
+/**
+ * Bind a getter that returns the persisted DataCat session token (or null).
+ * Lets dcFetch lazy-bootstrap a session for out-of-browse-view callers
+ * (link modal preview, gallery download, gallery-sync) without coupling
+ * the api file to CoreAPI/settings directly. Called once from init().
+ */
+export function setSavedTokenGetter(fn) { _getSavedToken = fn; }
+
+export function setSavedAccountTokenGetter(fn) { _getSavedAccountToken = fn; }
+
+export function setSavedDeviceTokenGetter(fn) { _getSavedDeviceToken = fn; }
+
+export function setDatacatClientIdGetter(fn) { _getDatacatClientId = fn; }
+
+export function getDatacatClientId() {
+    const id = _getDatacatClientId?.();
+    if (typeof id !== 'string') return null;
+    const trimmed = id.trim();
+    return trimmed || null;
+}
+
+export function getDatacatClientHeaders() {
+    const id = getDatacatClientId();
+    return id ? { 'X-CL-Datacat-Client': id } : {};
+}
+
+export async function dcHelperRequest(path, method = 'GET', data = null) {
+    const headers = getDatacatClientHeaders();
+    if (_apiRequest) {
+        if (Object.keys(headers).length === 0) {
+            return _apiRequest(path, method, data);
+        }
+        const apiHeaders = {
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': window.getCSRFToken?.() || '',
+            ...headers,
+        };
+        return _apiRequest(path, method, data, { headers: apiHeaders });
+    }
+
+    const config = {
+        method,
+        headers: {
+            'X-CSRF-Token': window.getCSRFToken?.() || '',
+            ...headers,
+        },
+    };
+    if (data != null) {
+        config.headers['Content-Type'] = 'application/json';
+        config.body = JSON.stringify(data);
+    }
+    return fetch(`/api${path}`, config);
+}
+
+export async function dcHelperJson(path, method = 'GET', data = null) {
+    let resp;
+    try {
+        resp = await dcHelperRequest(path, method, data);
+    } catch (err) {
+        return { ok: false, valid: false, error: err?.message || 'network error', reason: 'network error' };
+    }
+
+    let payload = null;
+    let text = '';
+    try {
+        text = await resp.clone().text();
+        if (text) payload = JSON.parse(text);
+    } catch {
+        payload = null;
+    }
+
+    if (resp.ok) {
+        return payload || { ok: true };
+    }
+
+    const message = payload?.error || payload?.reason || payload?.message || text || `request failed (${resp.status})`;
+    return {
+        ...(payload && typeof payload === 'object' ? payload : {}),
+        ok: false,
+        valid: false,
+        status: resp.status,
+        error: message,
+        reason: payload?.reason || message,
+    };
+}
+
+/**
+ * Push the saved token (or a fresh anonymous one) into cl-helper. Returns
+ * true if a usable session is now active. Concurrent callers share the
+ * in-flight bootstrap promise so we never run more than one /dc-init at
+ * a time. Reset on completion so a future 401 can re-arm.
+ */
+async function tryBootstrapSession() {
+    if (_bootstrapInFlight) return _bootstrapInFlight;
+    _bootstrapInFlight = (async () => {
+        try {
+            const savedToken = _getSavedToken?.() ?? null;
+            return !!(await initDcSession(savedToken));
+        } catch {
+            return false;
+        } finally {
+            _bootstrapInFlight = null;
+        }
+    })();
+    return _bootstrapInFlight;
+}
+
+/**
+ * Fetch a DataCat API path through the cl-helper plugin proxy.
+ * On 401/403, attempts to bootstrap a session once and retries.
+ * @param {string} apiPath - Path relative to datacat.run (e.g. /api/characters/recent-public?...)
+ * @returns {Promise<Response>}
+ */
+async function dcFetch(apiPath) {
+    if (!_apiRequest) throw new Error('DataCat: apiRequest not bound (cl-helper required)');
+    let resp = await dcHelperRequest(`${DC_PROXY_BASE}${apiPath}`);
+    if (resp.status === 401 || resp.status === 403) {
+        if (await tryBootstrapSession()) {
+            resp = await dcHelperRequest(`${DC_PROXY_BASE}${apiPath}`);
+        }
+    }
+    if (!resp.ok) {
+        let body = '';
+        try { body = await resp.clone().text(); } catch { /* ignore */ }
+        console.warn(`[DataCat] dcFetch ${resp.status} for ${apiPath}`, body.slice(0, 500));
+    }
+    return resp;
+}
+
+/**
+ * Check if the cl-helper plugin is available.
+ * @returns {Promise<boolean>}
+ */
+export async function checkDcPluginAvailable() {
+    try {
+        const resp = _apiRequest
+            ? await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/health`)
+            : await fetch(`/api${CL_HELPER_PLUGIN_BASE}/health`);
+        if (!resp.ok) return false;
+        const data = await resp.json();
+        return data?.ok === true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Try to restore a saved DataCat session token via cl-helper.
+ * Pushes the saved token to cl-helper and validates it.
+ * @param {string} savedToken - Previously saved session token
+ * @returns {Promise<boolean>} true if the saved token is still valid
+ */
+async function restoreSavedToken(savedToken) {
+    if (!savedToken || typeof savedToken !== 'string') return false;
+    try {
+        const deviceToken = _getSavedDeviceToken?.() || null;
+        const body = { token: savedToken };
+        if (deviceToken) body.deviceToken = deviceToken;
+        const setResp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-set-token`, 'POST', body);
+        if (!setResp.ok) return false;
+
+        const valResp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-validate`);
+        if (!valResp.ok) return false;
+        const data = await valResp.json();
+        return data?.valid === true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Initialize a DataCat session via cl-helper.
+ * If a saved token is provided, tries to restore it first.
+ * Otherwise (or if saved token is invalid), requests a fresh session.
+ * Returns the active token string on success so the caller can persist it.
+ * @param {string} [savedToken] - Previously saved session token to try first
+ * @param {boolean} [force] - Force a new token even if one is cached
+ * @returns {Promise<string|null>} The active session token, or null on failure
+ */
+export async function initDcSession(savedToken, force = false) {
+    try {
+        // Try restoring a saved token first (unless forcing refresh)
+        if (savedToken && !force) {
+            const restored = await restoreSavedToken(savedToken);
+            if (restored) return savedToken;
+        }
+
+        const resp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-init`, 'POST', force ? { force: true } : null);
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        if (data?.ok && data?.token) return data.token;
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Validate the current DataCat session on cl-helper.
+ * @returns {Promise<{valid: boolean, reason?: string}>}
+ */
+export async function validateDcSession() {
+    try {
+        const resp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-validate`);
+        if (!resp.ok) return { valid: false, reason: 'request failed' };
+        return await resp.json();
+    } catch {
+        return { valid: false, reason: 'network error' };
+    }
+}
+
+/**
+ * Clear the DataCat session token from cl-helper.
+ * @returns {Promise<boolean>}
+ */
+export async function clearDcSession() {
+    try {
+        const resp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-clear-token`, 'POST');
+        return resp.ok;
+    } catch {
+        return false;
+    }
+}
+
+export async function restoreDatacatAccount() {
+    const accountToken = _getSavedAccountToken?.() || null;
+    if (!accountToken) return { valid: false, reason: 'no saved account token', user: null };
+    const deviceToken = _getSavedDeviceToken?.() || null;
+    return dcHelperJson(`${CL_HELPER_PLUGIN_BASE}/dc-auth-set`, 'POST', { accountToken, deviceToken });
+}
+
+/**
+ * Account-scoped cl-helper call with one-shot session recovery.
+ *
+ * The account session lives in cl-helper's in-memory store and is wiped when
+ * the ST server restarts. Account endpoints (yours / follow / following) then
+ * 401 with "No DataCat account session configured" even though the saved
+ * account token still lives in settings. On that 401 we re-push the saved
+ * token via restoreDatacatAccount() once and retry -- mirroring how dcFetch
+ * self-heals the anonymous browse session. If no account token is saved, or
+ * recovery fails, the original 401 is returned untouched for the caller to
+ * surface as an error.
+ */
+async function dcAccountJson(path, method = 'GET', data = null) {
+    const result = await dcHelperJson(path, method, data);
+    if (result?.status !== 401 || !_getSavedAccountToken?.()) return result;
+    const restore = await restoreDatacatAccount();
+    if (!(restore?.ok || restore?.valid)) return result;
+    return dcHelperJson(path, method, data);
+}
+
+export async function loginDatacatAccount(email, password) {
+    return dcHelperJson(`${CL_HELPER_PLUGIN_BASE}/dc-auth-login`, 'POST', { email, password });
+}
+
+export async function validateDatacatAccount() {
+    return dcHelperJson(`${CL_HELPER_PLUGIN_BASE}/dc-auth-status`);
+}
+
+export async function logoutDatacatAccount() {
+    return dcHelperJson(`${CL_HELPER_PLUGIN_BASE}/dc-auth-logout`, 'POST');
+}
+
+export async function fetchDatacatYoursStatus(characterId) {
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-yours/${encodeURIComponent(characterId)}/status`);
+}
+
+export async function setDatacatYoursSaved(characterId, saved) {
+    const method = saved ? 'POST' : 'DELETE';
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-yours/${encodeURIComponent(characterId)}`, method);
+}
+
+/**
+ * Fetch a page of the signed-in account's followed creators for one source.
+ * @param {Object} [opts] - see {@link buildDatacatFollowingPath}
+ * @returns {Promise<{ok: boolean, total: number, list: Object[], error?: string}>}
+ */
+export async function fetchDatacatFollowing(opts = {}) {
+    const path = buildDatacatFollowingPath(opts).replace('/api/creators/following', '/dc-following');
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${path}`);
+}
+
+/**
+ * Follow (POST) or unfollow (DELETE) a creator on the account.
+ * @param {string} creatorId - UUID
+ * @param {boolean} follow
+ * @returns {Promise<{ok: boolean, following?: boolean, error?: string}>}
+ */
+export async function setDatacatFollow(creatorId, follow) {
+    const method = follow ? 'POST' : 'DELETE';
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-follow/${encodeURIComponent(creatorId)}`, method);
+}
+
+export const DATACAT_MAIN_FOLDER_ID = 'main';
+
+function normalizePositiveInteger(value) {
+    if (typeof value === 'number') return Number.isInteger(value) && value > 0 ? value : null;
+    const text = String(value ?? '').trim();
+    if (!/^\d+$/.test(text)) return null;
+    const id = Number(text);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function normalizeDatacatIdList(values) {
+    const list = Array.isArray(values) ? values : String(values ?? '').split(',');
+    return list
+        .map(value => normalizePositiveInteger(value))
+        .filter(id => Number.isInteger(id) && id > 0);
+}
+
+function normalizeDatacatCharacterId(value) {
+    const id = String(value ?? '').trim();
+    return /^[a-f0-9][a-f0-9-]{6,62}[a-f0-9]$/i.test(id) && !id.includes('--') ? id : null;
+}
+
+export function normalizeDatacatFolderId(value) {
+    const text = String(value ?? '').trim().toLowerCase();
+    if (!text || text === 'all') return null;
+    if (text === DATACAT_MAIN_FOLDER_ID || text === '-1') return DATACAT_MAIN_FOLDER_ID;
+    return normalizePositiveInteger(value);
+}
+
+export function normalizeDatacatFolderPayload(payload = {}) {
+    if (!payload || typeof payload !== 'object') return null;
+    const title = String(payload.title ?? '').trim().replace(/\s+/g, ' ');
+    if (!title || title.length > 120) return null;
+    const description = String(payload.description ?? '').trim();
+    if (description.length > 500) return null;
+    return { title, description };
+}
+
+export function buildDatacatFoldersPath({ minTotalTokens = null, activeTagIds = [], blockedTagIds = [] } = {}) {
+    const params = new URLSearchParams();
+    if (Number.isFinite(Number(minTotalTokens))) params.set('minTotalTokens', String(Number(minTotalTokens)));
+    const active = normalizeDatacatIdList(activeTagIds);
+    const blocked = normalizeDatacatIdList(blockedTagIds);
+    if (active.length > 0) params.set('activeTagIds', active.join(','));
+    if (blocked.length > 0) params.set('blockedTagIds', blocked.join(','));
+    const query = params.toString();
+    return `/dc-folders${query ? `?${query}` : ''}`;
+}
+
+export function buildDatacatFolderCharactersPath({
+    folderId = null,
+    limit = 80,
+    offset = 0,
+    minTotalTokens = MIN_TOTAL_TOKENS,
+    tagIds = [],
+    blockedTagIds = [],
+    search = '',
+    sort = 'added',
+} = {}) {
+    const params = new URLSearchParams();
+    params.set('limit', String(Math.max(1, Number(limit) || 80)));
+    params.set('offset', String(Math.max(0, Number(offset) || 0)));
+    if (Number.isFinite(Number(minTotalTokens))) params.set('minTotalTokens', String(Number(minTotalTokens)));
+    const tags = normalizeDatacatIdList(tagIds);
+    const blocked = normalizeDatacatIdList(blockedTagIds);
+    if (tags.length > 0) params.set('tagIds', tags.join(','));
+    if (blocked.length > 0) params.set('blockedTagIds', blocked.join(','));
+    const folder = normalizeDatacatFolderId(folderId);
+    if (folder === DATACAT_MAIN_FOLDER_ID) params.set('mainOnly', '1');
+    else if (Number.isInteger(folder) && folder > 0) params.set('folderId', String(folder));
+    const cleanSearch = String(search || '').trim();
+    if (cleanSearch) params.set('search', cleanSearch);
+    params.set('sort', String(sort || 'added'));
+    return `/dc-folder-characters?${params.toString()}`;
+}
+
+/**
+ * Validate an explicit folder-order list for the reorder endpoint.
+ * DataCat rejects partial or malformed lists, so this is all-or-nothing: any
+ * non-folder id, duplicate, or empty list yields null rather than a filtered list.
+ * @param {Array<string|number>} values
+ * @returns {number[]|null}
+ */
+export function normalizeDatacatFolderIdList(values) {
+    if (!Array.isArray(values) || values.length === 0) return null;
+    const ids = [];
+    for (const value of values) {
+        const id = normalizePositiveInteger(value);
+        if (!Number.isInteger(id) || id <= 0) return null;
+        if (ids.includes(id)) return null;
+        ids.push(id);
+    }
+    return ids;
+}
+
+export function buildDatacatFolderReorderPath() {
+    return '/dc-folders/reorder';
+}
+
+export function buildDatacatFolderItemPath(folderId, characterId) {
+    const folder = normalizeDatacatFolderId(folderId);
+    const character = normalizeDatacatCharacterId(characterId);
+    if (!Number.isInteger(folder) || folder <= 0 || !character) return null;
+    return `/dc-folders/${encodeURIComponent(String(folder))}/items/${encodeURIComponent(character)}`;
+}
+
+export async function fetchDatacatFolders(opts = {}) {
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${buildDatacatFoldersPath(opts)}`);
+}
+
+export async function createDatacatFolder(payload = {}) {
+    const body = normalizeDatacatFolderPayload(payload);
+    if (!body) return { ok: false, error: 'Folder title is required' };
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-folders`, 'POST', body);
+}
+
+export async function updateDatacatFolder(folderId, payload = {}) {
+    const folder = normalizeDatacatFolderId(folderId);
+    const body = normalizeDatacatFolderPayload(payload);
+    if (!Number.isInteger(folder) || folder <= 0) return { ok: false, error: 'Invalid DataCat folder id' };
+    if (!body) return { ok: false, error: 'Folder title is required' };
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-folders/${encodeURIComponent(String(folder))}`, 'PATCH', body);
+}
+
+export async function deleteDatacatFolder(folderId) {
+    const folder = normalizeDatacatFolderId(folderId);
+    if (!Number.isInteger(folder) || folder <= 0) return { ok: false, error: 'Invalid DataCat folder id' };
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}/dc-folders/${encodeURIComponent(String(folder))}`, 'DELETE');
+}
+
+/**
+ * Persist a new collection order on the DataCat account.
+ * Mirrors DataCat's own client: it echoes the saved order back, and a mismatch
+ * means the server did not apply what we asked for, so treat that as a failure.
+ * @param {Array<string|number>} folderIds - every custom folder id, in display order
+ * @returns {Promise<{ok: boolean, folderIds?: number[], error?: string}>}
+ */
+export async function reorderDatacatFolders(folderIds) {
+    const ids = normalizeDatacatFolderIdList(folderIds);
+    if (!ids) return { ok: false, error: 'Invalid DataCat folder order' };
+    const res = await dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${buildDatacatFolderReorderPath()}`, 'PUT', { folderIds: ids });
+    if (!res?.ok) return { ok: false, error: res?.error || res?.reason || 'Could not save folder order' };
+    const saved = Array.isArray(res.folderIds) ? res.folderIds.map(Number).filter(Number.isFinite) : ids;
+    if (saved.length !== ids.length || !saved.every((id, i) => id === ids[i])) {
+        return { ok: false, error: 'DataCat saved a different folder order' };
+    }
+    return { ok: true, folderIds: saved };
+}
+
+export async function setDatacatFolderMembership(folderId, characterId, member) {
+    const path = buildDatacatFolderItemPath(folderId, characterId);
+    if (!path) return { ok: false, error: 'Invalid DataCat folder or character id' };
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${path}`, member ? 'PUT' : 'DELETE');
+}
+
+export async function fetchDatacatFolderCharacters(opts = {}) {
+    return dcAccountJson(`${CL_HELPER_PLUGIN_BASE}${buildDatacatFolderCharactersPath(opts)}`);
+}
+export const DATACAT_EXTERNAL_PREINDEX_SOURCES = new Set(['hampter', 'meilisearch', 'saucepan']);
+
+const DATACAT_YOURS_COLLECTABLE_FLAGS = [
+    'isCollected',
+    'viewer_is_collected',
+    'is_collected',
+    'collected',
+    'isOwnedByViewer',
+    'is_owned_by_viewer',
+    'isPublicFeedInDb',
+    'is_public_feed_in_db',
+    'isSystemPublicInDb',
+    'is_system_public_in_db',
+    'isPublicInDb',
+    'is_public_in_db',
+    'isFullyExtractedInDb',
+    'is_fully_extracted_in_db',
+    // Field names actually present on /api/characters/recent-public?summary=1 rows.
+    // DataCat surfaces collectability here via the public-feed / extracted flags,
+    // not the *_in_db names above, so these must count as positive signals.
+    'isPublic',
+    'is_public',
+    'appearOnPublicFeed',
+    'appear_on_public_feed',
+    'isExtractedByYou',
+    'is_extracted_by_you',
+    'hasJannyRecovery',
+    'has_janny_recovery',
+    'isRecoveryPlaceholder',
+    'is_recovery_placeholder',
+];
+
+const DATACAT_YOURS_SAVED_FLAGS = [
+    'isCollected',
+    'viewer_is_collected',
+    'is_collected',
+    'collected',
+];
+
+const DATACAT_YOURS_EXPLICIT_DB_SIGNAL_FLAGS = [
+    'isOwnedByViewer',
+    'is_owned_by_viewer',
+    'isPublicFeedInDb',
+    'is_public_feed_in_db',
+    'isSystemPublicInDb',
+    'is_system_public_in_db',
+    'isPublicInDb',
+    'is_public_in_db',
+    'isFullyExtractedInDb',
+    'is_fully_extracted_in_db',
+    'hasPartialExtraction',
+    'has_partial_extraction',
+    'hasJannyRecovery',
+    'has_janny_recovery',
+    'isRecoveryPlaceholder',
+    'is_recovery_placeholder',
+];
+
+function hasOwnFlag(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+/**
+ * DataCat can only collect/save records that exist in its character table.
+ * Creator-profile and external-search rows may have a source UUID before the
+ * DataCat character record has been extracted, so UUID alone is not enough.
+ *
+ * Unknown DataCat-native public rows are treated as collectable to preserve the
+ * existing public feed behavior. Rows with explicit extraction DB flags, or
+ * external pre-index sources, must prove collectability first.
+ *
+ * @param {Object|null} hit
+ * @returns {boolean}
+ */
+export function isDatacatYoursCollectableHit(hit) {
+    if (!hit || typeof hit !== 'object') return false;
+    if (hit._fullCharacter && typeof hit._fullCharacter === 'object') return true;
+    if (hit.character && typeof hit.character === 'object') return true;
+
+    // External pre-index rows (Hampter/Meili/Saucepan) are not DataCat records yet,
+    // so exclude them before checking positive flags in case a future search source
+    // carries a public/extracted flag of its own.
+    const source = String(hit._source || '').trim().toLowerCase();
+    if (DATACAT_EXTERNAL_PREINDEX_SOURCES.has(source)) return false;
+
+    if (DATACAT_YOURS_COLLECTABLE_FLAGS.some(key => hit[key] === true)) return true;
+    if (hit.hasPartialExtraction === true || hit.has_partial_extraction === true) return false;
+
+    const hasExplicitDbSignal = DATACAT_YOURS_EXPLICIT_DB_SIGNAL_FLAGS.some(key => hasOwnFlag(hit, key));
+    if (hasExplicitDbSignal) return false;
+
+    return true;
+}
+
+/**
+ * Resolve whether a row is currently saved in DataCat Yours.
+ *
+ * `savedOverride` lets the CL-side live toggle cache supersede stale listing
+ * data after the user saves or unsaves without a full DataCat reload.
+ *
+ * @param {Object|null} hit
+ * @param {boolean|null} [savedOverride=null]
+ * @returns {boolean}
+ */
+export function isDatacatYoursSavedHit(hit, savedOverride = null) {
+    if (typeof savedOverride === 'boolean') return savedOverride;
+    if (!hit || typeof hit !== 'object') return false;
+    return DATACAT_YOURS_SAVED_FLAGS.some(key => hit[key] === true);
+}
+
+export function buildDatacatYoursCharactersPath({ limit = 80, offset = 0, minTotalTokens = MIN_TOTAL_TOKENS, tagIds = [] } = {}) {
+    const params = new URLSearchParams();
+    params.set('limit', String(Math.max(1, Number(limit) || 80)));
+    params.set('offset', String(Math.max(0, Number(offset) || 0)));
+    if (Number.isFinite(Number(minTotalTokens))) params.set('minTotalTokens', String(Number(minTotalTokens)));
+    const cleanTagIds = Array.isArray(tagIds)
+        ? tagIds.map(id => parseInt(String(id), 10)).filter(id => Number.isFinite(id) && id > 0)
+        : [];
+    if (cleanTagIds.length > 0) params.set('tagIds', cleanTagIds.join(','));
+    params.set('sort', 'added');
+    return `/api/characters?${params.toString()}`;
+}
+
+/**
+ * Build the DataCat "creators I follow" list route.
+ * Mirrors the site's own following page: GET /api/creators/following.
+ * @param {Object} [opts]
+ * @param {'janitor'|'saucepan'} [opts.sourceKind='janitor']
+ * @param {number} [opts.limit=50]
+ * @param {number} [opts.offset=0]
+ * @param {string} [opts.sortBy='total_chats']
+ * @param {string} [opts.sortDir='desc']
+ * @returns {string}
+ */
+export function buildDatacatFollowingPath({ sourceKind = 'janitor', limit = 50, offset = 0, sortBy = 'total_chats', sortDir = 'desc' } = {}) {
+    const params = new URLSearchParams();
+    params.set('sourceKind', sourceKind === 'saucepan' ? 'saucepan' : 'janitor');
+    params.set('limit', String(Math.max(1, Number(limit) || 50)));
+    params.set('offset', String(Math.max(0, Number(offset) || 0)));
+    params.set('sortBy', String(sortBy || 'total_chats'));
+    params.set('sortDir', String(sortDir || 'desc'));
+    return `/api/creators/following?${params.toString()}`;
+}
+
+/**
+ * Map a DataCat follow-list row to CL's followed-creator shape.
+ * DataCat rows: { creatorId, sourceKind, userName, ... }; CL expects
+ * { id, name, source } where janitor follows render as the 'datacat' source.
+ * @param {Object|null} row
+ * @returns {{id: string, name: string, source: 'datacat'|'saucepan'}|null}
+ */
+export function mapDatacatFollowRow(row) {
+    if (!row || typeof row !== 'object') return null;
+    const id = row.creatorId || row.id;
+    if (!id) return null;
+    return {
+        id,
+        name: row.userName || row.creatorName || id,
+        source: row.sourceKind === 'saucepan' ? 'saucepan' : 'datacat',
+    };
+}
+
+// ========================================
+// JANITORAI ACCOUNT AUTH (Supabase GoTrue)
+// ========================================
+// Unlocks page 2+ of the Hampter sorts. JanitorAI auth is Supabase; the
+// anon key below is their PUBLIC publishable key (role:anon), shipped in the janitorai
+// frontend bundle, safe to embed. Login/refresh hit supabase.co directly (CORS *, and it is
+// NOT behind JanitorAI's Cloudflare bot gate), so the whole flow is client-side, no cl-helper.
+// Access tokens live ~3h; the refresh token rotates on every use, so callers must persist the
+// new one each refresh. Pure HTTP here; the stateful session layer lives in datacat-provider.
+
+const JANITORAI_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1jbXp4dHpvbW1wbnhreW5kZGJvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MjgzNzA3NDAsImV4cCI6MjA0Mzk0Njc0MH0.UfRPni4ga9Lmin8j0JjV5ouuK9bXp8tsqPJ8pMTDDAI';
+const JANITORAI_AUTH_BASE = 'https://mcmzxtzommpnxkynddbo.supabase.co/auth/v1';
+const JANITORAI_TOKEN_URL = `${JANITORAI_AUTH_BASE}/token`;
+
+function janitoraiAuthHeaders() {
+    return { 'apikey': JANITORAI_ANON_KEY, 'Authorization': `Bearer ${JANITORAI_ANON_KEY}`, 'Content-Type': 'application/json' };
+}
+
+/** Decode a JanitorAI access-token JWT's claims (email + exp ms). Empty on failure. */
+export function decodeJanitoraiClaims(jwt) {
+    try {
+        const p = JSON.parse(atob(String(jwt).split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+        return { email: p.email || '', expMs: (p.exp || 0) * 1000 };
+    } catch { return { email: '', expMs: 0 }; }
+}
+
+// Direct password login is not usable: JanitorAI gates it behind Cloudflare Turnstile,
+// whose sitekey is domain-locked to janitorai.com and cant be solved from CL's origin. So the
+// session is seeded from the sb-auth-auth-token cookie (grabbed once from a real browser login,
+// where the user already solved Turnstile), and kept alive by the captcha-free refresh grant.
+
+function janitoraiB64decode(s) {
+    let t = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (t.length % 4) t += '=';
+    return atob(t);
+}
+
+/**
+ * Extract the token pair from a pasted JanitorAI session: the sb-auth-auth-token cookie value
+ * (base64-<json>), a raw session JSON, or a bare access-token JWT (no refresh; short-lived).
+ * @returns {{access_token: string, refresh_token: string}|null}
+ */
+export function parseJanitoraiSession(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    let s = raw.trim();
+    if (s.startsWith('base64-')) s = s.slice('base64-'.length);
+    let json = null;
+    try {
+        const dec = janitoraiB64decode(s);
+        if (dec.includes('access_token')) json = JSON.parse(dec);
+    } catch { /* not base64 json */ }
+    if (!json && s.startsWith('{')) {
+        try { json = JSON.parse(s); } catch { /* not json */ }
+    }
+    if (json?.access_token) {
+        return { access_token: json.access_token, refresh_token: json.refresh_token || '' };
+    }
+    const jm = s.match(/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+    return jm ? { access_token: jm[0], refresh_token: '' } : null;
+}
+
+/**
+ * Exchange a (single-use, rotating) refresh token for a fresh pair. `dead` marks a
+ * revoked/expired refresh token so the caller can clear the stored session.
+ * @returns {Promise<{access_token: string, refresh_token: string, dead?: boolean}>}
+ */
+export async function janitoraiRefreshGrant(refreshToken) {
+    if (!refreshToken) return { access_token: '', refresh_token: '', dead: true };
+    let resp;
+    try {
+        resp = await fetch(`${JANITORAI_TOKEN_URL}?grant_type=refresh_token`, {
+            method: 'POST', headers: janitoraiAuthHeaders(), body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+    } catch (e) {
+        return { access_token: '', refresh_token: '', dead: false }; // transient; keep the token for retry
+    }
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data?.access_token) {
+        const dead = resp.status === 400 || resp.status === 401;
+        return { access_token: '', refresh_token: '', dead };
+    }
+    return { access_token: data.access_token, refresh_token: data.refresh_token || refreshToken };
+}
+
+/**
+ * Check an access token server-side against the auth service. Kept off Cloudflare on
+ * purpose: a hampter probe cant tell a bad token from a blocked preflight.
+ * @returns {Promise<{valid: boolean, transient?: boolean}>} transient = auth service unreachable or erroring (429/5xx)
+ */
+export async function janitoraiVerifyToken(accessToken) {
+    if (!accessToken) return { valid: false };
+    let resp;
+    try {
+        resp = await fetch(`${JANITORAI_AUTH_BASE}/user`, {
+            headers: { 'apikey': JANITORAI_ANON_KEY, 'Authorization': `Bearer ${accessToken}` },
+        });
+    } catch {
+        return { valid: false, transient: true };
+    }
+    if (resp.ok) return { valid: true };
+    return { valid: false, transient: resp.status === 429 || resp.status >= 500 };
+}
+
+// ========================================
+// METADATA FETCH
+// ========================================
+
+/**
+ * Fetch full character data from the DataCat REST API.
+ * @param {string} characterId - UUID
+ * @param {'janitor'|'saucepan'|null} [sourceKind] - upstream source hint; required for freshly-extracted chars
+ * @returns {Promise<Object|null>} character object or null
+ */
+export async function fetchDatacatCharacter(characterId, sourceKind = null) {
+    if (!characterId) return null;
+    try {
+        const qs = sourceKind ? `?sourceKind=${encodeURIComponent(sourceKind)}` : '';
+        const response = await dcFetch(`/api/characters/${characterId}${qs}`);
+        if (!response.ok) return null;
+        const data = await response.json();
+        return data?.character || null;
+    } catch (e) {
+        console.error('[DataCat] fetchDatacatCharacter failed:', characterId, e);
+        return null;
+    }
+}
+
+/**
+ * Fetch the V2-like download payload for a character.
+ * @param {string} characterId - UUID
+ * @param {'janitor'|'saucepan'|null} [sourceKind] - upstream source hint
+ * @returns {Promise<Object|null>} { data: { name, tags, avatar, ... } }
+ */
+export async function fetchDatacatDownload(characterId, sourceKind = null) {
+    if (!characterId) return null;
+    try {
+        const params = new URLSearchParams({ t: String(Date.now()) });
+        if (sourceKind) params.set('sourceKind', sourceKind);
+        const response = await dcFetch(`/api/characters/${characterId}/download?${params.toString()}`);
+        if (!response.ok) return null;
+        return response.json();
+    } catch (e) {
+        console.error('[DataCat] fetchDatacatDownload failed:', characterId, e);
+        return null;
+    }
+}
+
+/**
+ * Fetch creator profile.
+ * @param {string} creatorId - UUID
+ * @returns {Promise<Object|null>}
+ */
+export async function fetchDatacatCreator(creatorId) {
+    if (!creatorId) return null;
+    try {
+        const response = await dcFetch(`/api/creators/${creatorId}`);
+        if (!response.ok) return null;
+        const data = await response.json();
+        return data?.creator || null;
+    } catch (e) {
+        console.error('[DataCat] fetchDatacatCreator failed:', creatorId, e);
+        return null;
+    }
+}
+
+/**
+ * Fetch a creator's character list (paginated).
+ * @param {string} creatorId - UUID
+ * @param {Object} [opts]
+ * @param {number} [opts.limit=24]
+ * @param {number} [opts.offset=0]
+ * @param {string} [opts.sortBy='chat_count']
+ * @returns {Promise<{total: number, list: Object[]}|null>} null only for a missing id; failures throw classified errors
+ */
+export async function fetchDatacatCreatorCharacters(creatorId, opts = {}) {
+    if (!creatorId) return null;
+    const { limit = 24, offset = 0, sortBy = 'chat_count' } = opts;
+    const response = await dcFetch(`/api/creators/${creatorId}/characters?limit=${limit}&offset=${offset}&sortBy=${sortBy}`);
+    const data = await readJsonClassified(response);
+    return { total: data.total || 0, list: data.list || [] };
+}
+
+/**
+ * Fetch the signed-in account's DataCat Yours collection.
+ * DataCat's own Yours view uses /api/characters with the account session.
+ * @param {Object} [opts]
+ * @param {number} [opts.limit=80]
+ * @param {number} [opts.offset=0]
+ * @param {number[]} [opts.tagIds]
+ * @param {number} [opts.minTotalTokens=MIN_TOTAL_TOKENS]
+ * @returns {Promise<{totalCount: number, characters: Object[]}|null>}
+ */
+export async function fetchDatacatYoursCharacters(opts = {}) {
+    try {
+        const response = await dcFetch(buildDatacatYoursCharactersPath(opts));
+        if (!response.ok) return null;
+        const data = await response.json();
+        if (data?.success === false) return null;
+        const characters = Array.isArray(data?.characters) ? data.characters : [];
+        return {
+            totalCount: data?.count || data?.totalCount || characters.length,
+            characters: characters.map(character => ({
+                ...character,
+                isCollected: true,
+                viewer_is_collected: true,
+                is_collected: true,
+                collected: true,
+            })),
+        };
+    } catch (e) {
+        console.error('[DataCat] fetchDatacatYoursCharacters failed:', e);
+        return null;
+    }
+}
+
+// ========================================
+// BROWSE / SEARCH
+// ========================================
+
+/**
+ * Fetch recent public characters (the main browse endpoint).
+ * @param {Object} [opts]
+ * @param {number} [opts.limit=24]
+ * @param {number} [opts.offset=0]
+ * @param {number[]} [opts.tagIds] - Active tag ID filters
+ * @param {string} [opts.search] - Full text search (matches character AND creator names)
+ * @param {string} [opts.sortBy] - Result order; the endpoint honors only 'score' (verified live)
+ * @param {number} [opts.minTotalTokens=MIN_TOTAL_TOKENS]
+ * @returns {Promise<{totalCount: number, characters: Object[]}>} failures throw classified errors
+ */
+export async function fetchRecentPublic(opts = {}) {
+    const { limit = 24, offset = 0, tagIds = [], search = '', sortBy = '', minTotalTokens = MIN_TOTAL_TOKENS } = opts;
+    let path = `/api/characters/recent-public?limit=${limit}&offset=${offset}&summary=1&minTotalTokens=${minTotalTokens}`;
+    if (tagIds.length > 0) path += `&tagIds=${tagIds.join(',')}`;
+    if (search) path += `&search=${encodeURIComponent(search)}`;
+    if (sortBy) path += `&sortBy=${encodeURIComponent(sortBy)}`;
+    const response = await dcFetch(path);
+    const data = await readJsonClassified(response);
+    return { totalCount: data.totalCount || 0, characters: data.characters || [] };
+}
+
+/**
+ * Fetch fresh/sorted characters from the /fresh endpoint.
+ * Returns two time windows: last24h and thisWeek.
+ * @param {Object} [opts]
+ * @param {string} [opts.sortBy='score'] - 'score' | 'fresh' | 'chat_count'
+ * @param {number} [opts.limit24=80] - Max characters for last-24h window
+ * @param {number} [opts.limitWeek=20] - Max characters for this-week window
+ * @returns {Promise<{sortBy: string, last24h: Object[], thisWeek: Object[]}>} failures throw classified errors
+ */
+export async function fetchFreshCharacters(opts = {}) {
+    const { sortBy = 'score', limit24 = 80, limitWeek = 20 } = opts;
+    const path = `/api/characters/fresh?summary=1&sortBy=${sortBy}&limit24=${limit24}&limitWeek=${limitWeek}`;
+    const response = await dcFetch(path);
+    const data = await readJsonClassified(response);
+    const w = data.windows || {};
+    return {
+        sortBy: data.sortBy || sortBy,
+        last24h: w.last24h?.characters || [],
+        thisWeek: w.thisWeek?.characters || [],
+    };
+}
+
+/**
+ * Fetch faceted tag list with counts (optionally narrowed by active tags).
+ * @param {Object} [opts]
+ * @param {number[]} [opts.activeTagIds] - Currently selected tag IDs (adjusts counts)
+ * @param {number} [opts.minTotalTokens=MIN_TOTAL_TOKENS]
+ * @returns {Promise<{groups: Object[], tags: Object[]}|null>}
+ */
+export async function fetchFacetedTags(opts = {}) {
+    const { activeTagIds = [], minTotalTokens = MIN_TOTAL_TOKENS } = opts;
+    try {
+        let path = `/api/tags/faceted?mode=recent&minTotalTokens=${minTotalTokens}`;
+        if (activeTagIds.length > 0) path += `&activeTagIds=${activeTagIds.join(',')}`;
+        const response = await dcFetch(path);
+        if (!response.ok) return null;
+        const data = await response.json();
+        return { groups: data.groups || [], tags: data.tags || [] };
+    } catch (e) {
+        console.error('[DataCat] fetchFacetedTags failed:', e);
+        return null;
+    }
+}
+
+// ========================================
+// TAG HELPERS
+// ========================================
+
+/**
+ * Extract plain tag names from DataCat tags.
+ * Tags shape varies by source:
+ *   - JanitorAI: array of { id, name, slug } objects with emoji-prefixed names
+ *   - Saucepan: array of plain slug strings
+ * @param {Array<{name: string, slug: string}|string>} tags
+ * @returns {string[]}
+ */
+export function resolveTagNames(tags) {
+    if (!Array.isArray(tags)) return [];
+    return tags.map(t => {
+        if (typeof t === 'string') return t.trim();
+        const name = t?.name || t?.slug || '';
+        return name.replace(/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\u200D]+\s*/u, '').trim() || name;
+    }).filter(Boolean);
+}
+
+// ========================================
+// V2 CARD BUILDER
+// ========================================
+
+/**
+ * Pick the active server-side content variant from a DataCat character row.
+ *
+ * For Saucepan characters with hidden definitions, DataCat's "Character Repair"
+ * job exposes the recovered body via `content_variants[primary].content` with
+ * the `description` field overloaded to carry the repaired body text.
+ *
+ * Since the jannyai-recovery release, essentially every JanitorAI row ALSO
+ * carries a primary `janitor_core` variant, and that one uses plain janitor
+ * conventions instead (description = site blurb, personality = definition).
+ * Consumers must map the variant by source kind; treating `description` as
+ * the body is only correct for Saucepan repair variants.
+ *
+ * @returns {Object|null} The variant content object, or null when no
+ *   non-placeholder primary variant is present.
+ */
+export function pickRecoveryVariant(character) {
+    const variants = character?.content_variants;
+    if (!Array.isArray(variants) || !variants.length) return null;
+    const primary = variants.find(v => v && v.isPrimary && !v.isRecoveryPlaceholder);
+    return primary?.content || null;
+}
+
+// Recovery-sourced chara_card_v2_json bodies carry edge ##DESCRIPTION START##-style delimiter lines; /download bodies never do.
+export function stripDatacatMarkers(text) {
+    if (!text || typeof text !== 'string') return text || '';
+    return text
+        .replace(/^\s*##[A-Z _]*(?:START|END)##[ \t]*\r?\n?/, '')
+        .replace(/\r?\n?[ \t]*##[A-Z _]*(?:START|END)##\s*$/, '')
+        .trim();
+}
+
+const HAMPTER_SCRIPT_PATH_RE = /^\/hampter\/script\/[a-f0-9-]{36}$/i;
+
+/** True when the row advertises a public lorebook whose content wasnt obtained. */
+export function hasUnfetchedLorebook(character) {
+    const scripts = character?.scripts;
+    if (!Array.isArray(scripts)) return false;
+    return scripts.some(s => s && s.type === 'lorebook' && s.is_public && !s.script);
+}
+
+/**
+ * Fetch missing lorebook script content from janitorai's hampter endpoint and merge it
+ * onto the row's script entries in place. DataCat dropped the inline `script` field from
+ * rows; the content lives at `api_path` on janitorai.com (CORS *).
+ *
+ * Deliberately a plain direct fetch, NOT fetchWithProxy: the endpoint only accepts
+ * browser TLS fingerprints, so the /proxy/ fallback (undici) is a guaranteed 403, and a
+ * poisoned _proxyOrigins entry for janitorai.com would skip the working direct attempt.
+ *
+ * @returns {Promise<boolean>} true when no public lorebook is left unfetched
+ */
+export async function hydrateDatacatScripts(character, { signal } = {}) {
+    const scripts = character?.scripts;
+    if (!Array.isArray(scripts) || !scripts.length) return true;
+    for (const s of scripts) {
+        if (!s || s.type !== 'lorebook' || !s.is_public || s.script) continue;
+        // Listed publicly but the creator locked the content; hampter serves metadata only.
+        if (s.is_code_public === false) continue;
+        if (typeof s.api_path !== 'string' || !HAMPTER_SCRIPT_PATH_RE.test(s.api_path)) continue;
+        try {
+            const resp = await fetch(`https://janitorai.com${s.api_path}`, {
+                signal,
+                headers: { 'Accept': 'application/json' },
+            });
+            if (!resp.ok) {
+                console.warn('[DataCat] script hydration got HTTP', resp.status, 'for', s.api_path);
+                continue;
+            }
+            const full = await resp.json();
+            if (typeof full?.script === 'string' && full.script) {
+                s.script = full.script;
+                if (!s.settings && typeof full.settings === 'string') s.settings = full.settings;
+            } else {
+                console.warn('[DataCat] script hydration returned no content for', s.api_path);
+            }
+        } catch (e) {
+            // leave unfetched; consumers flag it via hasUnfetchedLorebook
+            console.warn('[DataCat] script hydration failed for', s.api_path, e?.message || e);
+        }
+    }
+    return !hasUnfetchedLorebook(character);
+}
+
+// Extract V2 character_book from character.scripts[]. DataCat stores lorebook
+// entries JSON-encoded in script.script; private scripts are metadata stubs.
+// Multi-script merge: first script's title/settings win, entries concatenate.
+export function extractCharacterBookFromScripts(character) {
+    const scripts = character?.scripts;
+    if (!Array.isArray(scripts) || !scripts.length) return null;
+    const usable = scripts.filter(s => s && s.type === 'lorebook' && s.is_public && s.script);
+    if (!usable.length) return null;
+
+    const allEntries = [];
+    for (const s of usable) {
+        let parsed;
+        try { parsed = JSON.parse(s.script); } catch { continue; }
+        if (!Array.isArray(parsed)) continue;
+        for (const e of parsed) {
+            if (!e || typeof e !== 'object') continue;
+            const keys = Array.isArray(e.key)
+                ? e.key
+                : (e.keysRaw ? String(e.keysRaw).split(/,\s*/).filter(Boolean) : []);
+            allEntries.push({
+                keys,
+                secondary_keys: [],
+                content: e.content || '',
+                extensions: {},
+                enabled: e.enabled !== false,
+                insertion_order: typeof e.insertion_order === 'number' ? e.insertion_order : (e.priority || 100),
+                case_sensitive: false,
+                name: e.name || '',
+                priority: typeof e.priority === 'number' ? e.priority : 10,
+                id: e.id ?? allEntries.length,
+                comment: '',
+                selective: false,
+                constant: e.constant === true,
+                position: 'before_char',
+            });
+        }
+    }
+    if (!allEntries.length) return null;
+
+    const first = usable[0];
+    let scanDepth = 4;
+    try {
+        const settings = first.settings ? JSON.parse(first.settings) : null;
+        if (settings && typeof settings.depth === 'number') scanDepth = settings.depth;
+    } catch { /* default */ }
+
+    return {
+        name: first.title || 'Lorebook',
+        description: first.description || '',
+        scan_depth: scanDepth,
+        token_budget: 0,
+        recursive_scanning: false,
+        extensions: {},
+        entries: allEntries,
+    };
+}
+
+/**
+ * Build a V2 character card from the character endpoint payload.
+ *
+ * Field mapping is source-dependent. DataCat aggregates multiple sources, each
+ * with different conventions for which field carries the character's body:
+ *
+ *   JanitorAI (default):
+ *     character.personality   -> data.description (main character definition)
+ *     character.description   -> data.creator_notes (website blurb)
+ *     Newer rows leave `personality` empty and carry the body only in
+ *     `chara_card_v2_json.data.description` (may be delimiter-wrapped) and
+ *     the /download payload; the primary variant mirrors the row.
+ *
+ *   Saucepan (open definition):
+ *     character.description   -> data.description (main character definition)
+ *     character.personality   -> usually null
+ *     companion_snapshot.full_description
+ *       (or chara_card_v2_json.data.creator_notes)
+ *                             -> data.creator_notes (formatted blurb/notes)
+ *
+ *   Saucepan (hidden definition):
+ *     `content_variants[primary].content` carries the repaired body via
+ *     the `description` field. /download returns empty in this case.
+ *     The blurb still lives in `companion_snapshot.full_description`.
+ *
+ *   Common across sources:
+ *     character.scenario      -> data.scenario
+ *     character.first_message -> data.first_mes
+ *     character.tags          -> data.tags (array of tag name strings)
+ *     character.creator_name  -> data.creator
+ *
+ * @param {Object} character - Character object from /api/characters/:id
+ * @returns {Object} V2-spec character card { spec, spec_version, data }
+ */
+export function buildV2FromDatacat(character) {
+    if (!character) return null;
+
+    const tagNames = resolveTagNames(character.tags);
+    const recovered = pickRecoveryVariant(character);
+    const isSaucepan = character?.primary_content_source_kind === 'saucepan';
+    const v2Data = character?.chara_card_v2_json?.data || null;
+
+    // /download used to be the only source for these three; it now 403s behind
+    // Cloudflare Turnstile (DataCat v0.97), so every import lands here instead. The
+    // detail payload's embedded V2 json still carries them. Saucepan repair variants
+    // ship their own card, so prefer that one when a recovery variant is present.
+    const recoveredV2 = recovered?.chara_card_v2_json?.data || null;
+    const bodyV2 = (isSaucepan && recoveredV2) ? recoveredV2 : (v2Data || recoveredV2);
+
+    // Only Saucepan repair variants overload description with the body; janitor variants mirror the row blurb, never the body.
+    const description = isSaucepan
+        ? (recovered?.description || recovered?.personality || v2Data?.description || character.description || '')
+        : (character.personality || recovered?.personality || stripDatacatMarkers(v2Data?.description) || '');
+    const scenario = isSaucepan
+        ? (recovered?.scenario || character.scenario || v2Data?.scenario || '')
+        : (character.scenario || recovered?.scenario || v2Data?.scenario || '');
+    const firstMessage = isSaucepan
+        ? (recovered?.first_message || character.first_message || v2Data?.first_mes || '')
+        : (character.first_message || recovered?.first_message || v2Data?.first_mes || '');
+    const creatorNotes = isSaucepan
+        ? (character?.companion_snapshot?.full_description
+            || character?.intercepted_chat_data?.companion_snapshot?.full_description
+            || v2Data?.creator_notes
+            || '')
+        : (character.description || recovered?.description || v2Data?.creator_notes || '');
+    const altGreetings = [character.alternate_greetings, recovered?.alternate_greetings, v2Data?.alternate_greetings]
+        .find(a => Array.isArray(a) && a.length) || [];
+
+    return {
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        data: {
+            name: character.chat_name || character.chatName || character.name || 'Unknown',
+            description,
+            personality: '',
+            scenario,
+            first_mes: firstMessage,
+            mes_example: bodyV2?.mes_example || '',
+            system_prompt: bodyV2?.system_prompt || '',
+            post_history_instructions: bodyV2?.post_history_instructions || '',
+            creator_notes: creatorNotes,
+            creator: character.creator_name || character.creatorName || '',
+            character_version: '1.0',
+            tags: tagNames,
+            alternate_greetings: altGreetings,
+            extensions: {
+                datacat: {
+                    id: character.character_id || character.characterId,
+                    sourceKind: character.primary_content_source_kind || null,
+                    creatorId: character.creator_id || character.creatorId || null,
+                    creatorName: character.creator_name || character.creatorName || null
+                }
+            },
+            character_book: extractCharacterBookFromScripts(character) || undefined
+        }
+    };
+}
+
+/**
+ * Build a V2 character card from the /download endpoint response.
+ * The download format is already close to V2 but needs wrapping.
+ *
+ * For Saucepan-with-hidden-definition cards, /download returns empty body
+ * fields. When a `character` object is supplied and contains an active
+ * recovery variant (`content_variants[primary].content`), we fall back to it
+ * for description, scenario, and first_mes. This keeps imports and update
+ * checks working for repaired Saucepan cards.
+ *
+ * @param {Object} downloadData - Response from /api/characters/:id/download
+ * @param {Object} [character] - Optional character metadata for enrichment
+ * @returns {Object|null}
+ */
+export function buildV2FromDownload(downloadData, character) {
+    const d = downloadData?.data;
+    if (!d) return null;
+
+    const recovered = character ? pickRecoveryVariant(character) : null;
+    const isSaucepan = character?.primary_content_source_kind === 'saucepan';
+    const v2Data = character?.chara_card_v2_json?.data || null;
+    // Old downloads carry the janitor body in personality, new ones are proper V2 (personality empty), so the || order covers both shapes, dont reorder.
+    const description = d.personality || d.description
+        || (isSaucepan
+            ? (recovered?.description || recovered?.personality || v2Data?.description || character?.description || '')
+            : (character?.personality || recovered?.personality || stripDatacatMarkers(v2Data?.description) || ''));
+    const scenario = d.scenario || recovered?.scenario || '';
+    const firstMes = d.first_mes || recovered?.first_message || '';
+    const creatorNotes = isSaucepan
+        ? (character?.companion_snapshot?.full_description
+            || character?.intercepted_chat_data?.companion_snapshot?.full_description
+            || v2Data?.creator_notes
+            || d.creator_notes
+            || '')
+        : (d.creator_notes || character?.description || '');
+    // New downloads ship URLs in creator/character_version; the real creator name lives in download metadata.
+    const isUrl = (s) => typeof s === 'string' && /^https?:\/\//i.test(s);
+    const creatorName = character?.creator_name || character?.creatorName
+        || downloadData?.metadata?.janitor_creator_name
+        || (isUrl(d.creator) ? '' : (d.creator || ''));
+    const cardVersion = (d.character_version && !isUrl(d.character_version)) ? d.character_version : '1.0';
+
+    return {
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        data: {
+            name: d.name || character?.chat_name || character?.chatName || character?.name || 'Unknown',
+            description,
+            personality: '',
+            scenario,
+            first_mes: firstMes,
+            mes_example: d.mes_example || '',
+            system_prompt: d.system_prompt || '',
+            post_history_instructions: d.post_history_instructions || '',
+            creator_notes: creatorNotes,
+            creator: creatorName,
+            character_version: cardVersion,
+            tags: d.tags || [],
+            alternate_greetings: d.alternate_greetings || [],
+            extensions: {
+                ...(d.extensions || {}),
+                datacat: {
+                    id: character?.character_id || character?.characterId || null,
+                    sourceKind: character?.primary_content_source_kind || null,
+                    creatorId: character?.creator_id || character?.creatorId || null,
+                    creatorName: character?.creator_name || character?.creatorName || null
+                }
+            },
+            // Download's character_book is often present-but-empty; fall through to scripts.
+            character_book: (d.character_book?.entries?.length ? d.character_book : null)
+                || extractCharacterBookFromScripts(character)
+                || undefined
+        }
+    };
+}
+
+// ========================================
+// EXTRACTION
+// ========================================
+
+/**
+ * Submit a JanitorAI character URL for extraction via DataCat's cloud browser.
+ * @param {string} janitorUrl - Full JanitorAI character URL
+ * @param {Object} [opts]
+ * @param {boolean} [opts.publicFeed=true]
+ * @param {boolean} [opts.alwaysReextract=false] - force re-extraction even if DataCat already has the character
+ * @param {boolean} [opts.useAccount=true] - use the restored DataCat account session when available
+ * @returns {Promise<{success: boolean, queued?: boolean, started?: boolean, queuePosition?: number, requestId?: string, error?: string, errorCode?: string}>}
+ */
+export async function submitExtraction(janitorUrl, { publicFeed = true, alwaysReextract = false, useAccount = true } = {}) {
+    if (!_apiRequest) throw new Error('DataCat: apiRequest not bound');
+    try {
+        const resp = await dcHelperRequest(`${CL_HELPER_PLUGIN_BASE}/dc-extract`, 'POST', { url: janitorUrl, publicFeed, alwaysReextract, useAccount });
+        if (!resp.ok) {
+            const errText = await resp.text();
+            console.error('[DataCat] dc-extract error:', resp.status, errText.substring(0, 200));
+            return { success: false, error: `Server returned ${resp.status}: ${errText.substring(0, 100)}` };
+        }
+        try {
+            return await resp.json();
+        } catch {
+            return { success: false, error: 'Invalid JSON response from cl-helper' };
+        }
+    } catch (e) {
+        console.error('[DataCat] submitExtraction failed:', e);
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Poll extraction status from DataCat.
+ * @returns {Promise<{inProgress: Object|null, queueLength: number, queue: Array, history: Array}|null>}
+ */
+export async function fetchExtractionStatus() {
+    try {
+        const resp = await dcFetch('/api/extraction/status-projection');
+        if (!resp.ok) return null;
+        return await resp.json();
+    } catch (e) {
+        console.error('[DataCat] fetchExtractionStatus failed:', e);
+        return null;
+    }
+}
+
+// ========================================
+// MEILISEARCH (JanitorAI index)
+// ========================================
+
+const MEILI_SORT_MAP = {
+    janny_newest: ['createdAtStamp:desc'],
+    janny_oldest: ['createdAtStamp:asc'],
+    janny_tokens_desc: ['totalToken:desc'],
+    janny_tokens_asc: ['totalToken:asc'],
+    janny_relevant: [],
+};
+
+/**
+ * Search JanitorAI characters via MeiliSearch.
+ * Returns results normalized to DataCat-compatible shape.
+ * @param {Object} opts
+ * @param {string} [opts.search='']
+ * @param {number} [opts.page=1]
+ * @param {number} [opts.limit=80]
+ * @param {string} [opts.sort='janny_newest']
+ * @param {boolean} [opts.nsfw=true]
+ * @param {Set<number>} [opts.includeTags] - JanitorAI tag IDs to require
+ * @returns {Promise<{characters: Object[], totalHits: number, totalPages: number}>}
+ */
+export async function searchMeiliJanny(opts = {}) {
+    const { search = '', page = 1, limit = 80, sort = 'janny_newest', nsfw = true, includeTags = new Set() } = opts;
+
+    const filters = [];
+    if (!nsfw) filters.push('isNsfw = false');
+    if (includeTags.size > 0) {
+        const tagClauses = [...includeTags].map(id => `tagIds = ${id}`);
+        filters.push(tagClauses.join(' AND '));
+    }
+
+    const data = await meiliMultiSearch({
+        search,
+        page,
+        limit,
+        filters,
+        facets: ['isNsfw', 'tagIds'],
+        sort: MEILI_SORT_MAP[sort] || MEILI_SORT_MAP.janny_newest,
+    });
+    const result = data?.results?.[0] || {};
+    const hits = result.hits || [];
+
+    const characters = hits.map(normalizeMeiliHit);
+
+    return {
+        characters,
+        totalHits: result.totalHits || 0,
+        totalPages: result.totalPages || 0,
+    };
+}
+
+// ========================================
+// HAMPTER (JanitorAI internal API)
+// ========================================
+
+const HAMPTER_API_BASE = 'https://janitorai.com/hampter/characters';
+
+/**
+ * Fetch characters from JanitorAI's Hampter API (trending/popular sort).
+ * @param {Object} opts
+ * @param {string} [opts.sort='trending'] - 'trending' or 'popular'
+ * @param {number} [opts.page=1]
+ * @param {string} [opts.search='']
+ * @param {boolean} [opts.nsfw=true] - false adds mode=sfw
+ * @param {string} [opts.authToken] - JanitorAI bearer; unlocks page 2+ of these sorts (rides either transport)
+ * @param {boolean} [opts.allowClearance=false] - let a Cloudflare block spend a clearance-refresh
+ *   tab. Only browse, which the user just asked for, opts in; anything background leaves it off.
+ * @returns {Promise<{characters: Object[], total: number, page: number, pageSize: number}>}
+ */
+export async function fetchHampterCharacters(opts = {}) {
+    const { sort = 'trending', page = 1, search = '', nsfw = true, authToken = '', allowClearance = false } = opts;
+    const params = new URLSearchParams({ sort, page: String(page) });
+    if (search) params.set('search', search);
+    if (!nsfw) params.set('mode', 'sfw');
+
+    const url = `${HAMPTER_API_BASE}?${params}`;
+    let data;
+
+    // Preferred transport: the userscript's GM_xmlhttpRequest carries cf_clearance, so it passes
+    // Cloudflare reliably; the direct fetch below only gets through when CF isn't challenging.
+    // The Bearer rides whichever transport runs (login is orthogonal to the CF gate).
+    // A transport failure falls through to the best-effort direct fetch below.
+    if (isJanitorBridgeAvailable()) {
+        let res = null;
+        try {
+            res = await janitorBridgeFetch(url, authToken, { allowClearance });
+        } catch { res = null; }
+        if (res) {
+            if (res.status === 401) {
+                const gated = new Error(authToken ? 'JanitorAI session expired' : 'JanitorAI requires signing in for this request');
+                gated.code = authToken ? 'HAMPTER_TOKEN_EXPIRED' : 'HAMPTER_LOGIN_REQUIRED';
+                gated.status = 401;
+                throw gated;
+            }
+            if (!res.ok) {
+                const blocked = new Error(classifyErrorPage(res.body, res.status) || `Hampter HTTP ${res.status}`);
+                blocked.code = 'HAMPTER_BLOCKED';
+                blocked.status = res.status;
+                throw blocked;
+            }
+            try {
+                data = JSON.parse(res.body);
+            } catch {
+                throw new Error(classifyErrorPage(res.body, res.status) || 'JanitorAI bridge returned non-JSON body');
+            }
+        }
+    }
+
+    if (data === undefined) {
+        // Best-effort direct browser fetch. Hampter serves CORS *, but a cross-origin fetch cannot
+        // send janitorai's cf_clearance cookie, so Cloudflare usually 403s it; the userscript bridge
+        // above is the reliable path. Deliberately not fetchWithProxy (the /proxy/ leg cant pass).
+        const headers = { 'Accept': 'application/json' };
+        if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+        let response = null;
+        try {
+            response = await fetch(url, { headers });
+        } catch { response = null; }
+        if (!response || !response.ok) {
+            const status = response?.status ?? 0;
+            if (status === 401) {
+                // With a token, 401 means it expired/was rejected; without, its the anon page-1 wall.
+                const gated = new Error(authToken ? 'JanitorAI session expired' : 'JanitorAI requires signing in for this request');
+                gated.code = authToken ? 'HAMPTER_TOKEN_EXPIRED' : 'HAMPTER_LOGIN_REQUIRED';
+                gated.status = 401;
+                throw gated;
+            }
+            const blocked = new Error(status ? `Hampter HTTP ${status}` : 'Hampter direct fetch failed');
+            blocked.code = 'HAMPTER_BLOCKED';
+            blocked.status = status;
+            throw blocked;
+        }
+        data = await response.json();
+    }
+
+    return {
+        characters: (data.data || []).map(normalizeHampterHit),
+        total: data.total || 0,
+        page: data.page || page,
+        pageSize: data.size || 34,
+    };
+}
+
+function normalizeHampterHit(hit) {
+    const tagNames = [
+        ...(hit.tags || []).map(t => ({ name: t.name, slug: t.slug || t.name?.toLowerCase() })),
+        ...(hit.custom_tags || []).map(t => typeof t === 'string' ? { name: t, slug: t.toLowerCase() } : { name: t.name || '', slug: t.slug || '' }),
+    ];
+
+    return {
+        character_id: hit.id,
+        name: decodeHtmlEntities(hit.name || 'Unknown'),
+        avatar: hit.avatar || '',
+        description: decodeHtmlEntities(hit.description || ''),
+        tags: tagNames,
+        creator_name: decodeHtmlEntities(hit.creator_name || ''),
+        creator_id: hit.creator_id || '',
+        created_at: hit.created_at || hit.first_published_at || '',
+        is_nsfw: hit.is_nsfw || false,
+        chat_count: hit.stats?.chat || 0,
+        message_count: hit.stats?.message || 0,
+        total_tokens: hit.total_tokens || 0,
+        _source: 'hampter',
+    };
+}
+
+/**
+ * Normalize a MeiliSearch hit to match the shape expected by DataCat card rendering.
+ */
+function normalizeMeiliHit(hit) {
+    const tagNames = (hit.tagIds || []).map(id => {
+        const name = JANNY_TAG_MAP[id];
+        return name ? { name, slug: name.toLowerCase() } : { name: `Tag ${id}`, slug: `tag-${id}` };
+    });
+
+    return {
+        character_id: hit.id,
+        name: decodeHtmlEntities(hit.name || 'Unknown'),
+        avatar: hit.avatar || '',
+        description: decodeHtmlEntities(hit.description || ''),
+        tags: tagNames,
+        creator_name: decodeHtmlEntities(hit.creatorUsername || ''),
+        creator_id: hit.creatorId || '',
+        createdAt: hit.createdAt || (hit.createdAtStamp ? new Date(hit.createdAtStamp * 1000).toISOString() : ''),
+        isNsfw: hit.isNsfw || false,
+        totalTokens: hit.totalToken || 0,
+        _source: 'meilisearch',
+    };
+}
