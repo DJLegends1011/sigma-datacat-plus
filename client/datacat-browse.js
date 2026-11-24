@@ -1734,10 +1734,10 @@ function showExtractionPanel(charId, originalUrl, source = 'janitor') {
                 Extraction typically takes 15-60 seconds. A public account is used by default.
             </p>
             <div class="datacat-extract-actions">
-                <button id="datacatExtractBtn" class="action-btn primary" data-url="${escapeHtml(sourceUrl)}" data-id="${escapeHtml(charId)}" data-source="${escapeHtml(source)}">
+                <button id="datacatExtractBtn" class="cl-btn cl-btn-primary" data-url="${escapeHtml(sourceUrl)}" data-id="${escapeHtml(charId)}" data-source="${escapeHtml(source)}">
                     <i class="fa-solid fa-cloud-arrow-down"></i> Extract Character
                 </button>
-                <a href="${escapeHtml(sourceUrl)}" target="_blank" class="action-btn secondary">
+                <a href="${escapeHtml(sourceUrl)}" target="_blank" class="cl-btn cl-btn-secondary">
                     <i class="fa-solid fa-external-link"></i> View on ${cfg.label}
                 </a>
             </div>
@@ -2467,7 +2467,7 @@ function renderFollowingEmpty(reason) {
 
     if (reason === 'no_follows') {
         grid.innerHTML = `
-            <div class="chub-timeline-empty">
+            <div class="browse-timeline-empty">
                 <i class="fa-solid fa-user-plus"></i>
                 <h3>No Followed Creators</h3>
                 <p>Browse characters and follow creators from their banner to see their characters here.</p>
@@ -2475,7 +2475,7 @@ function renderFollowingEmpty(reason) {
         `;
     } else {
         grid.innerHTML = `
-            <div class="chub-timeline-empty">
+            <div class="browse-timeline-empty">
                 <i class="fa-solid fa-inbox"></i>
                 <h3>No Characters Yet</h3>
                 <p>Creators you follow haven't posted characters yet.</p>
@@ -2576,7 +2576,7 @@ function renderFollowing(append = false) {
 
     if (sorted.length === 0 && datacatFollowingCharacters.length > 0) {
         grid.innerHTML = `
-            <div class="chub-timeline-empty">
+            <div class="browse-timeline-empty">
                 <i class="fa-solid fa-filter"></i>
                 <h3>No Matching Characters</h3>
                 <p>No characters match your current DataCat filters.</p>
@@ -2733,13 +2733,13 @@ function openPreviewModal(hit) {
     delete importBtn.dataset.extractPhase;
     if (inLibrary) {
         importBtn.innerHTML = '<i class="fa-solid fa-check"></i> In Library';
-        importBtn.classList.add('secondary');
-        importBtn.classList.remove('primary', 'warning');
+        importBtn.classList.add('cl-btn-secondary');
+        importBtn.classList.remove('cl-btn-primary', 'cl-btn-warning');
         importBtn.disabled = false;
     } else {
         importBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Loading...';
-        importBtn.classList.remove('primary', 'secondary', 'warning');
-        importBtn.classList.add('secondary');
+        importBtn.classList.remove('cl-btn-primary', 'cl-btn-secondary', 'cl-btn-warning');
+        importBtn.classList.add('cl-btn-secondary');
         importBtn.disabled = true;
     }
 
@@ -2807,7 +2807,7 @@ async function fetchAndPopulateDetails(hit, token) {
                 </div>
                 <p class="datacat-modal-extract-message">${escapeHtml(message)}</p>
                 <p class="datacat-modal-extract-hint">Use DataCat's extraction service to retrieve this character's full definition from ${cfg.label}.</p>
-                <button class="action-btn primary datacat-modal-extract-btn" data-extract-id="${escapeHtml(String(charId))}" data-extract-source="${source}">
+                <button class="cl-btn cl-btn-primary datacat-modal-extract-btn" data-extract-id="${escapeHtml(String(charId))}" data-extract-source="${source}">
                     <i class="fa-solid fa-cloud-arrow-down"></i> Extract Character
                 </button>
             </div>
@@ -2818,8 +2818,8 @@ async function fetchAndPopulateDetails(hit, token) {
         if (importBtn) {
             importBtn.disabled = false;
             importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Extract';
-            importBtn.classList.remove('primary', 'secondary', 'warning');
-            importBtn.classList.add('primary');
+            importBtn.classList.remove('cl-btn-primary', 'cl-btn-secondary', 'cl-btn-warning');
+            importBtn.classList.add('cl-btn-primary');
             importBtn.dataset.extractId = charId;
             importBtn.dataset.extractSource = source;
         }
@@ -3018,19 +3018,19 @@ async function fetchAndPopulateDetails(hit, token) {
             const inLibrary = isCharInLocalLibrary(hit);
             if (inLibrary) {
                 importBtn.innerHTML = '<i class="fa-solid fa-check"></i> In Library';
-                importBtn.classList.add('secondary');
-                importBtn.classList.remove('primary', 'warning');
+                importBtn.classList.add('cl-btn-secondary');
+                importBtn.classList.remove('cl-btn-primary', 'cl-btn-warning');
             } else {
                 const creatorName = character.creator_name || character.creatorName || hit.creator_name || '';
                 const possibleMatch = view.isCharPossibleMatch(name, creatorName);
                 if (possibleMatch) {
                     importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import (Possible Match)';
-                    importBtn.classList.add('warning');
-                    importBtn.classList.remove('primary', 'secondary');
+                    importBtn.classList.add('cl-btn-warning');
+                    importBtn.classList.remove('cl-btn-primary', 'cl-btn-secondary');
                 } else {
                     importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
-                    importBtn.classList.add('primary');
-                    importBtn.classList.remove('secondary', 'warning');
+                    importBtn.classList.add('cl-btn-primary');
+                    importBtn.classList.remove('cl-btn-secondary', 'cl-btn-warning');
                 }
             }
             importBtn.disabled = false;
@@ -4198,12 +4198,12 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
 
             <!-- Following Section -->
             <div id="datacatFollowingSection" class="browse-section hidden">
-                <div class="chub-timeline-header">
-                    <div class="chub-timeline-header-left">
+                <div class="browse-timeline-header">
+                    <div class="browse-timeline-header-left">
                         <h3><i class="fa-solid fa-clock"></i> Timeline</h3>
                         <p>New characters from creators you follow</p>
                     </div>
-                    <div class="chub-timeline-header-right">
+                    <div class="browse-timeline-header-right">
                         <button class="follow-mgr-toggle-btn glass-btn" id="datacatFollowMgrToggle"
                                 title="Manage followed creators">
                             <i class="fa-solid fa-users-gear"></i> Manage
@@ -4237,7 +4237,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                             <span id="datacatFolderSep" class="browse-meta-sep" style="display:none"> • </span><button
                                 type="button"
                                 id="datacatFolderBtn"
-                                class="browse-meta-action"
+                                class="browse-meta-action browse-fav-toggle"
                                 title="Add to collection"
                                 aria-label="Add to collection"
                                 aria-haspopup="dialog"
@@ -4247,10 +4247,10 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                     </div>
                 </div>
                 <div class="modal-controls">
-                    <a id="datacatOpenInBrowserBtn" href="#" target="_blank" class="action-btn secondary" title="Open on DataCat">
+                    <a id="datacatOpenInBrowserBtn" href="#" target="_blank" class="cl-btn cl-btn-secondary" title="Open on DataCat">
                         <i class="fa-solid fa-external-link"></i> Open
                     </a>
-                    <button id="datacatImportBtn" class="action-btn primary" title="Download to SillyTavern">
+                    <button id="datacatImportBtn" class="cl-btn cl-btn-primary" title="Import to your library">
                         <i class="fa-solid fa-download"></i> Import
                     </button>
                     <button class="close-btn" id="datacatCharClose">&times;</button>
