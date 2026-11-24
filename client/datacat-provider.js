@@ -11,7 +11,7 @@ import { importFromPng, fetchWithProxy } from '/modules/providers/provider-utils
 import datacatBrowseView, { openDatacatCharPreview } from './datacat-browse.js';
 // CL-only: janitor-bridge.js userscript bridge, no Sigma equivalent
 import './datacat-avatar-restore.js';
-import { PROVIDER_ID } from './datacat-id.js';
+import { PROVIDER_ID, EXT_ID } from './datacat-id.js';
 import {
     DATACAT_API_BASE,
     resolveDatacatAvatarUrl,
@@ -39,10 +39,6 @@ import {
     connectDatacatAccountToken,
     validateDatacatAccount,
     logoutDatacatAccount,
-    parseJanitoraiSession,
-    janitoraiRefreshGrant,
-    janitoraiVerifyToken,
-    decodeJanitoraiClaims,
 } from './datacat-api.js';
 import {
     filterPickerFolders,
@@ -605,89 +601,55 @@ export async function datacatReorderFolders(folderIds) {
 }
 
 // ── JanitorAI account session (Supabase; unlocks Hampter pagination) ──────────
-// Stateful layer over the pure grant helpers: persists the access token + rotating
-// refresh token in extension settings, refreshes proactively, and shares one in-flight refresh
-// so concurrent Hampter loads cant race the single-use refresh token.
-let _janitoraiRefreshInFlight = null;
+// The token pair lives on the server half per Sigma account (server/janitorai-session.js); the
+// page only asks for a current access token when it pages a Hampter sort, and never stores it.
+const JAI_BASE = `/ext/${EXT_ID}`;
 
-async function janitoraiDoRefresh() {
-    if (_janitoraiRefreshInFlight) return _janitoraiRefreshInFlight;
-    _janitoraiRefreshInFlight = (async () => {
-        const rt = getDcSetting('datacatJanitoraiRefreshToken');
-        const res = await janitoraiRefreshGrant(rt);
-        if (res.access_token) {
-            setDcSetting('datacatJanitoraiToken', res.access_token);
-            if (res.refresh_token) setDcSetting('datacatJanitoraiRefreshToken', res.refresh_token);
-            return res.access_token;
-        }
-        // Only wipe the stored session when the refresh token is definitively dead,
-        // never on a transient network blip (keeps the user logged in across hiccups).
-        if (res.dead) {
-            setDcSetting('datacatJanitoraiToken', '');
-            setDcSetting('datacatJanitoraiRefreshToken', '');
-        }
-        return '';
-    })();
-    try { return await _janitoraiRefreshInFlight; }
-    finally { _janitoraiRefreshInFlight = null; }
+async function jaiJson(path, method = 'GET', data = null) {
+    try {
+        const resp = await CoreAPI.apiRequest(`${JAI_BASE}${path}`, method, data);
+        const body = await resp.json().catch(() => null);
+        if (!resp.ok) return { ok: false, error: body?.error || `DataCat Plus server answered ${resp.status}` };
+        return body || {};
+    } catch (e) {
+        return { ok: false, error: e?.message || 'DataCat Plus server not reachable' };
+    }
 }
 
-// Current valid access token, refreshing within 2min of expiry. '' when logged out / refresh failed.
+// Current valid access token (the server refreshes within 2 min of expiry). '' when logged out.
 export async function datacatJanitoraiGetToken() {
-    const tok = getDcSetting('datacatJanitoraiToken') || '';
-    if (!tok) return '';
-    const { expMs } = decodeJanitoraiClaims(tok);
-    if (expMs && expMs - Date.now() > 120000) return tok;
-    return (await janitoraiDoRefresh()) || '';
+    return (await jaiJson('/jai-token'))?.token || '';
 }
 
 // Force a refresh (reactive path after an unexpected 401). Returns the new token or ''.
 export async function datacatJanitoraiForceRefresh() {
-    return janitoraiDoRefresh();
+    return (await jaiJson('/jai-token?force=1'))?.token || '';
 }
 
-// Seed the session from a pasted sb-auth-auth-token cookie (or session JSON / bare JWT).
-// Verification stays off Cloudflare-gated hampter: its preflight can 403 on a perfectly
-// good token, and failing after the up-front rotation would strand the fresh pair.
+// Seed the session from a pasted sb-auth-auth-token cookie; verified and stored by the server half.
 export async function datacatJanitoraiSetSession(pasted) {
-    const pair = parseJanitoraiSession(pasted);
-    if (!pair) return { ok: false, error: 'Could not find a session in that value. Copy the whole sb-auth-auth-token cookie.' };
-    const { email, expMs } = decodeJanitoraiClaims(pair.access_token);
-    let token = pair.access_token;
-    // If the pasted access token is already stale but a refresh token came with it, rotate up front.
-    if ((!expMs || expMs - Date.now() < 120000) && pair.refresh_token) {
-        const r = await janitoraiRefreshGrant(pair.refresh_token);
-        if (!r.access_token) {
-            return { ok: false, error: r.dead
-                ? 'That session is expired or invalid. Copy a fresh cookie after logging in again.'
-                : 'Could not reach the JanitorAI auth service. Try again in a moment.' };
-        }
-        // A successful grant is itself the proof; the rotation consumed the single-use pasted
-        // token, so proceed straight to persist.
-        token = r.access_token;
-        pair.refresh_token = r.refresh_token;
-    } else {
-        // No rotation ran, nothing consumed yet: confirm the pasted token before storing.
-        const v = await janitoraiVerifyToken(token);
-        if (!v.valid) {
-            return { ok: false, error: v.transient
-                ? 'Could not reach the JanitorAI auth service. Try again in a moment.'
-                : 'That session is expired or invalid. Copy a fresh cookie after logging in again.' };
-        }
+    return jaiJson('/jai-session', 'POST', { pasted });
+}
+
+export async function datacatJanitoraiLogout() {
+    return jaiJson('/jai-session', 'DELETE');
+}
+
+export async function datacatJanitoraiSessionStatus() {
+    const st = await jaiJson('/jai-status');
+    return st?.loggedIn ? st : { loggedIn: false };
+}
+
+// One-time move of a pair an earlier build kept in this extension's settings to the server.
+export async function migrateJanitoraiSettingsToServer() {
+    const access = getDcSetting('datacatJanitoraiToken') || '';
+    const refresh = getDcSetting('datacatJanitoraiRefreshToken') || '';
+    if (!access && !refresh) return;
+    const pasted = JSON.stringify({ access_token: access, refresh_token: refresh });
+    const res = await datacatJanitoraiSetSession(pasted);
+    // clear the settings copy once the server holds it, or when it is no longer valid anyway
+    if (res?.ok || /expired|invalid|find a session/i.test(res?.error || '')) {
+        setDcSetting('datacatJanitoraiToken', '');
+        setDcSetting('datacatJanitoraiRefreshToken', '');
     }
-    setDcSetting('datacatJanitoraiToken', token);
-    setDcSetting('datacatJanitoraiRefreshToken', pair.refresh_token || '');
-    return { ok: true, email: decodeJanitoraiClaims(token).email || email, hasRefresh: !!pair.refresh_token };
-}
-
-export function datacatJanitoraiLogout() {
-    setDcSetting('datacatJanitoraiToken', '');
-    setDcSetting('datacatJanitoraiRefreshToken', '');
-}
-
-export function datacatJanitoraiSessionStatus() {
-    const tok = getDcSetting('datacatJanitoraiToken') || '';
-    if (!tok) return { loggedIn: false };
-    const { email, expMs } = decodeJanitoraiClaims(tok);
-    return { loggedIn: true, email, expMs, hasRefresh: !!getDcSetting('datacatJanitoraiRefreshToken') };
 }

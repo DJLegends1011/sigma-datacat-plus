@@ -117,7 +117,7 @@ export function settingsMarkup() {
     <div class="settings-group">
         <div class="settings-group-title"><i class="fa-solid fa-user-lock"></i> JanitorAI Login (Hampter pagination)</div>
         <div class="settings-row">
-            <span class="settings-hint">Optional, and separate from the JanitorAI provider's own login. JanitorAI serves only the <strong>first page</strong> of the Hampter sorts without an account. Paste your session cookie to page through more; the session then <strong>refreshes itself</strong> (no repeated pasting). To get it: log in at <strong>janitorai.com</strong>, open DevTools (F12) &rarr; <strong>Application &rarr; Cookies &rarr; janitorai.com</strong>, and copy the value of the <strong>sb-auth-auth-token</strong> cookie. Stored in this extension's settings for your Sigma account. Tip: paste from a browser you are not actively browsing JanitorAI in, so the two sessions do not rotate each other out.</span>
+            <span class="settings-hint">Optional, and separate from the JanitorAI provider's own login. JanitorAI serves only the <strong>first page</strong> of the Hampter sorts without an account. Paste your session cookie to page through more; the session then <strong>refreshes itself</strong> (no repeated pasting). To get it: log in at <strong>janitorai.com</strong>, open DevTools (F12) &rarr; <strong>Application &rarr; Cookies &rarr; janitorai.com</strong>, and copy the value of the <strong>sb-auth-auth-token</strong> cookie. Kept on this Sigma server for your account; the page only borrows a short-lived access token while paging. Tip: paste from a browser you are not actively browsing JanitorAI in, so the two sessions do not rotate each other out.</span>
         </div>
         <div class="settings-row">
             <label>Cookie:</label>
@@ -430,8 +430,8 @@ export function bindSettings(root, { settings, CoreAPI, signal }) {
     // ── JanitorAI session (Hampter pagination) ──
     const jaiInput = $('dcPlusJanitoraiToken');
     const jaiStatus = $('dcPlusJanitoraiTokenStatus');
-    function renderJaiStatus() {
-        const st = datacatJanitoraiSessionStatus();
+    async function renderJaiStatus() {
+        const st = await datacatJanitoraiSessionStatus();
         if (st.loggedIn) badge(jaiStatus, true, `<i class="fa-solid fa-circle"></i> Logged in${st.email ? ` as ${esc(st.email)}` : ''}`);
         else badge(jaiStatus, false, '<i class="fa-solid fa-circle"></i> Not logged in');
     }
@@ -456,8 +456,8 @@ export function bindSettings(root, { settings, CoreAPI, signal }) {
         }
     });
 
-    on($('dcPlusClearJanitoraiTokenBtn'), 'click', () => {
-        datacatJanitoraiLogout();
+    on($('dcPlusClearJanitoraiTokenBtn'), 'click', async () => {
+        await datacatJanitoraiLogout();
         if (jaiInput) jaiInput.value = '';
         renderJaiStatus();
         CoreAPI.showToast('JanitorAI session cleared', 'info');

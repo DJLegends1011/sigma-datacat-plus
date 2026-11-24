@@ -19,6 +19,8 @@ const { startSigma } = await import(pathToFileURL(kitPath).href);
 const realFetch = globalThis.fetch;
 const upstreamCalls = [];
 let datacatResponder = null;
+const supabaseCalls = [];
+let supabaseResponder = null;
 
 function jsonResp(body, status = 200, headers = {}) {
     return new Response(JSON.stringify(body), {
@@ -41,6 +43,10 @@ let bob;
 before(async () => {
     globalThis.fetch = async (input, init) => {
         const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes('.supabase.co/auth/v1/')) {
+            supabaseCalls.push({ url, body: init?.body });
+            return supabaseResponder ? supabaseResponder(url, init) : jsonResp({ error: 'unstubbed' }, 500);
+        }
         if (url.startsWith('https://datacat.run/')) {
             // sameHostFetch hands fetch a Headers instance, so normalise to a plain object with the sent casing
             const sent = new Headers(init?.headers || {});
@@ -241,4 +247,53 @@ test('/dc-proxy answers are sandboxed and size-capped; no route echoes a token',
         const r = await aliceExt(path);
         assert.doesNotMatch(JSON.stringify(r.body ?? ''), /secret-acct-token|alice-anon-token|alice-device-token/);
     }
+});
+
+// a JWT with the given claims (signature is not checked by the code under test)
+const jwt = (claims) => `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.sig`;
+
+test('JanitorAI login lives server-side: stored per account, refreshed there, refresh token never sent', async () => {
+    const aliceExt = alice.ext('datacat-plus');
+    const bobExt = bob.ext('datacat-plus');
+    const soon = Math.floor(Date.now() / 1000) + 30; // inside the 2 min margin
+    const later = Math.floor(Date.now() / 1000) + 3 * 3600;
+    const stale = jwt({ email: 'a@example.com', exp: soon });
+    const fresh = jwt({ email: 'a@example.com', exp: later });
+    supabaseCalls.length = 0;
+    supabaseResponder = (url, init) => {
+        const body = JSON.parse(init.body);
+        if (url.includes('grant_type=refresh_token') && body.refresh_token === 'rt-1') return jsonResp({ access_token: fresh, refresh_token: 'rt-2' });
+        if (url.includes('grant_type=refresh_token') && body.refresh_token === 'rt-2') return jsonResp({ access_token: fresh, refresh_token: 'rt-3' });
+        return jsonResp({ error: 'invalid_grant' }, 400);
+    };
+    const cookie = 'base64-' + Buffer.from(JSON.stringify({ access_token: stale, refresh_token: 'rt-1' })).toString('base64');
+    const set = await aliceExt('/jai-session', 'POST', { pasted: cookie });
+    assert.equal(set.body.ok, true);
+    assert.equal(set.body.email, 'a@example.com');
+    assert.doesNotMatch(JSON.stringify(set.body), /rt-\d/);
+
+    const row = sigma.db('alice').prepare("SELECT access_token, refresh_token FROM x_datacat_plus_jai WHERE user_handle = 'alice'").get();
+    assert.equal(row.refresh_token, 'rt-2', 'the pasted refresh token was rotated and the new one kept');
+
+    const st = await aliceExt('/jai-status');
+    assert.equal(st.body.loggedIn, true);
+    assert.doesNotMatch(JSON.stringify(st.body), /rt-\d|eyJ/);
+    assert.deepEqual((await bobExt('/jai-status')).body, { loggedIn: false });
+
+    const tok = await aliceExt('/jai-token');
+    assert.equal(tok.body.token, fresh);
+    assert.deepEqual(Object.keys(tok.body), ['token']);
+    assert.equal((await bobExt('/jai-token')).body.token, '');
+
+    const forced = await aliceExt('/jai-token?force=1');
+    assert.equal(forced.body.token, fresh);
+    assert.equal(sigma.db('alice').prepare("SELECT refresh_token FROM x_datacat_plus_jai WHERE user_handle = 'alice'").get().refresh_token, 'rt-3');
+
+    assert.equal((await aliceExt('/jai-session', 'DELETE')).body.ok, true);
+    assert.deepEqual((await aliceExt('/jai-status')).body, { loggedIn: false });
+});
+
+test('the JanitorAI settings keys no longer hold the login', () => {
+    const src = fs.readFileSync(path.join(extDir, 'client/datacat-provider.js'), 'utf8');
+    assert.doesNotMatch(src, /setDcSetting\('datacatJanitorai(Refresh)?Token', (?!'')/);
 });

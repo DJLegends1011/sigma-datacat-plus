@@ -1,5 +1,5 @@
 // DataCat Plus client entry: registers the DataCat Plus provider, overlays, and Settings > Online section.
-import datacatProvider, { setDatacatProviderSettings } from './datacat-provider.js';
+import datacatProvider, { setDatacatProviderSettings, migrateJanitoraiSettingsToServer } from './datacat-provider.js';
 import {
     setDatacatBrowseSettings,
     setDatacatAccountLoggedIn,
@@ -37,6 +37,9 @@ export default {
             beta: true,
             avatarTap: { imgId: 'datacatCharAvatar', dataFull: true },
         });
+
+        // an earlier build kept the JanitorAI login in settings; hand it to the server half once
+        void migrateJanitoraiSettingsToServer().catch(() => {});
 
         // Register preview, creator banner, and avatar-restore overlays via the Sigma overlay ledger
         ctx.ui.addOverlay({ id: 'preview', close: closePreviewModal, visible: isPreviewOpen });
