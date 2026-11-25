@@ -85,3 +85,8 @@ test('blocked tags reach DataCat on the feeds that take them, and hide the rest 
     assert.match(browse, /fetchFacetedTags\(\{ activeTagIds: \[\.\.\.datacatActiveTagIds\], blockedTagIds: blockedTagIdList\(\) \}\)/);
     assert.equal((browse.match(/filter\(c => !isDatacatRowBlocked\(c\)\)/g) || []).length, 2);
 });
+
+test('a pending blocked-tags save is dropped on sign-out or switch-off', () => {
+    assert.match(browse, /if \(!datacatAccountLoggedIn \|\| !_settings \|\| forAccount !== datacatBlockedSyncToken\) return;/);
+    assert.match(browse, /if \(!settings\) \{ clearTimeout\(datacatBlockedSaveTimer\)/);
+});

@@ -69,6 +69,7 @@ let _settings = null;
 let datacatAccountLoggedIn = false;
 
 export function setDatacatBrowseSettings(settings) {
+    if (!settings) { clearTimeout(datacatBlockedSaveTimer); datacatBlockedSaveTimer = null; }
     _settings = settings;
     // the local block list lives in settings: read it once they arrive
     datacatBlockedLoaded = false;
@@ -78,6 +79,7 @@ export function setDatacatBrowseSettings(settings) {
 export function setDatacatAccountLoggedIn(loggedIn) {
     const changed = datacatAccountLoggedIn !== !!loggedIn;
     datacatAccountLoggedIn = !!loggedIn;
+    if (changed && !loggedIn) { clearTimeout(datacatBlockedSaveTimer); datacatBlockedSaveTimer = null; }
     // signing in swaps the local block list for the account's; signing out goes back to the local one
     if (changed || !datacatBlockedLoaded) void syncDatacatBlockedTags();
 }
@@ -251,8 +253,11 @@ function scheduleBlockedSave() {
     if (!datacatAccountLoggedIn) return;
     clearTimeout(datacatBlockedSaveTimer);
     // a burst of clicks is one save, as DataCat's site batches it
+    const forAccount = datacatBlockedSyncToken;
     datacatBlockedSaveTimer = setTimeout(async () => {
         datacatBlockedSaveTimer = null;
+        // signed out, switched off or the list re-synced meanwhile: this save belongs to no one now
+        if (!datacatAccountLoggedIn || !_settings || forAccount !== datacatBlockedSyncToken) return;
         const res = await saveDatacatBlockedTags([...datacatBlockedTags.values()]).catch(err => ({ ok: false, error: err.message }));
         if (!res?.ok) showToast(`Couldn't save blocked tags to your DataCat account: ${res?.error || 'unknown error'}`, 'error');
     }, 450);
@@ -1274,7 +1279,8 @@ function updateTagsButton() {
     // Sigma's count badge (it also feeds the phone's overflow label); a Hampter sort sends no
     // tags, so the greyed button counts none there
     // blocked tags count too: they shape every feed, the JanitorAI sorts included (by tag name)
-    const count = isHampterSortMode(datacatSortMode) ? 0 : isJannyTagMode()
+    // a Hampter sort sends no tags, but blocked ones still hide its cards by name, so they count
+    const count = isHampterSortMode(datacatSortMode) ? datacatBlockedTags.size : isJannyTagMode()
         ? jannyActiveTagIds.size + datacatBlockedTags.size
         : datacatActiveTagIds.size + datacatBlockedTags.size;
     setFilterCount(btn, 'Tags', count);

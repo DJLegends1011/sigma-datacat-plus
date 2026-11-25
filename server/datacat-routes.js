@@ -834,6 +834,8 @@ export function registerDataCatRoutes(router, ctx = null) {
                 });
             }
             const keep = current.data;
+            // a session DataCat no longer treats as signed in: writing now would send creators/hiding empty
+            if (keep.authenticated === false) return res.status(401).json({ error: 'DataCat account session expired: sign in again' });
             const body = {
                 tags,
                 ...(Array.isArray(keep.creators) ? { creators: keep.creators } : {}),

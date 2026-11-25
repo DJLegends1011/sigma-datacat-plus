@@ -294,6 +294,15 @@ test('blocked tags read and write the account list, keeping its creators and hid
     const notList = await aliceExt('/dc-blocked-tags', 'PUT', { tags: 'nsfw' });
     assert.equal(notList.status, 400);
 
+    // DataCat answers but no longer counts the session as signed in: no write
+    putBody = null;
+    const savedStored = stored;
+    stored = { success: true, authenticated: false };
+    const stale = await aliceExt('/dc-blocked-tags', 'PUT', { tags: [{ id: 414 }] });
+    assert.equal(stale.status, 401);
+    assert.equal(putBody, null);
+    stored = savedStored;
+
     // bob has no DataCat account session: refused, nothing sent upstream
     upstreamCalls.length = 0;
     const bobRead = await bobExt('/dc-blocked-tags');

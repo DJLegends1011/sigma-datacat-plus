@@ -23,6 +23,11 @@ describe('imported cards keep the creator\'s custom tags', () => {
         assert.deepEqual(card.data.tags, ['Male', 'Smut', 'flirty', 'rich', 'influencer', 'cosplay']);
     });
 
+    it('decodes HTML-encoded custom tags', () => {
+        const card = buildV2FromDatacat({ ...row, tags: [], custom_tags: ['Tom &amp; Jerry', 'it&#39;s'] });
+        assert.deepEqual(card.data.tags, ['Tom & Jerry', "it's"]);
+    });
+
     it('a row with no custom_tags still works', () => {
         const card = buildV2FromDatacat({ ...row, custom_tags: undefined });
         assert.deepEqual(card.data.tags, ['Male', 'Smut']);

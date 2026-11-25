@@ -863,8 +863,9 @@ export async function fetchFacetedTags(opts = {}) {
 export function resolveTagNames(tags) {
     if (!Array.isArray(tags)) return [];
     return tags.map(t => {
-        if (typeof t === 'string') return t.trim();
-        const name = t?.name || t?.slug || '';
+        // creators' custom tags can arrive HTML-encoded (&amp;), as JanitorAI's own import decodes them
+        if (typeof t === 'string') return decodeHtmlEntities(t).trim();
+        const name = decodeHtmlEntities(t?.name || t?.slug || '');
         return name.replace(/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\u200D]+\s*/u, '').trim() || name;
     }).filter(Boolean);
 }
