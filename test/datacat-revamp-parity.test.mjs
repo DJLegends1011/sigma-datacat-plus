@@ -48,3 +48,7 @@ test('D: a collection add collects on the same server trip and shows a spinner, 
     // the merged call never runs the separate save-to-Main first
     assert.doesNotMatch(picker, /ensureCollected/);
 });
+
+test('C: the preview lists the creator\'s custom tags after DataCat\'s, as Sigma\'s JanitorAI preview does', () => {
+    assert.match(browse, /resolveTagNames\(\[\.\.\.\(character\.tags \|\| \[\]\), \.\.\.\(character\.custom_tags \|\| \[\]\)\]\)/);
+});

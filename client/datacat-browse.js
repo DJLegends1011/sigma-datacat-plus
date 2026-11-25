@@ -2966,10 +2966,13 @@ async function fetchAndPopulateDetails(hit, token) {
         }
 
         // Update tags only if they differ from what's already rendered
-        if (character.tags?.length) {
+        // the site's tags, then the creator's own (custom_tags), as Sigma's JanitorAI preview lists them
+        if (character.tags?.length || character.custom_tags?.length) {
             const tagsEl = document.getElementById('datacatCharTags');
             if (tagsEl) {
-                const fullTags = resolveTagNames(character.tags);
+                const seen = new Set();
+                const fullTags = resolveTagNames([...(character.tags || []), ...(character.custom_tags || [])])
+                    .filter(t => { const k = t.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
                 const newHtml = fullTags.map(t => `<span class="browse-tag">${escapeHtml(t)}</span>`).join('');
                 if (tagsEl.innerHTML !== newHtml) tagsEl.innerHTML = newHtml;
             }

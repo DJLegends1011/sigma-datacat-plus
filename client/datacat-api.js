@@ -1034,7 +1034,10 @@ export function extractCharacterBookFromScripts(character) {
 export function buildV2FromDatacat(character) {
     if (!character) return null;
 
-    const tagNames = resolveTagNames(character.tags);
+    // DataCat's tags, then the creator's own custom_tags, as Sigma's JanitorAI import keeps them (buildV2FromJanitorai)
+    const tagSeen = new Set();
+    const tagNames = resolveTagNames([...(character.tags || []), ...(character.custom_tags || [])])
+        .filter(t => { const k = t.toLowerCase(); if (tagSeen.has(k)) return false; tagSeen.add(k); return true; });
     const recovered = pickRecoveryVariant(character);
     const isSaucepan = character?.primary_content_source_kind === 'saucepan';
     const v2Data = character?.chara_card_v2_json?.data || null;
