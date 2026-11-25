@@ -103,3 +103,7 @@ test('dispose closes the picker (and its keyboard listeners)', async () => {
     const ix = await read('../client/index.js');
     assert.match(ix, /dispose\(\) \{[\s\S]*?closeDatacatFolderPicker\(\);[\s\S]*?\n    \},/);
 });
+
+test('the picker header has no character name (it is always one card, the preview already shows it)', () => {
+    assert.doesNotMatch(picker, /datacatFolderPickerCount|pl-picker-count/);
+});

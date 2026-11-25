@@ -211,7 +211,6 @@ function ensureModal() {
         <div class="cl-modal-content pl-picker-content">
             <div class="cl-modal-header">
                 <h3><i class="fa-solid fa-heart"></i> Add to Collection</h3>
-                <span id="datacatFolderPickerCount" class="pl-picker-count"></span>
                 <button type="button" id="datacatFolderPickerCloseBtn" class="cl-modal-close" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
             </div>
             <div class="cl-modal-body cl-modal-body-flush">
@@ -514,7 +513,6 @@ export async function openDatacatFolderPicker({ anchor, characterId, characterNa
     _openCharId = id;
     _openCharName = String(characterName || 'character');
     _openEl = listEl();
-    document.getElementById('datacatFolderPickerCount').textContent = _openCharName;
     const search = document.getElementById('datacatFolderPickerSearch');
     if (search) search.value = '';
     modal.classList.add('visible');
