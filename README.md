@@ -21,7 +21,7 @@ While **DataCat Plus** is enabled, **switch off Sigma's built-in DataCat provide
 
 ## Next Steps
 
-- **Side-by-side check**: compare every control with Sigma's own DataCat in a throwaway Sigma (the 2026-11-24 parity audit's fixes are in; behaviour not yet checked in a browser).
+- **Beta testing**: desktop and mobile checks are in progress (the side-by-side check against Sigma's own DataCat passed on 2026-11-24).
 - **Real-account login test**: Verify end-to-end login, folder sync, follow sync, and account-backed extraction against a live `datacat.run` account.
 - **Hosted-browser fallback**: Add a hosted-browser fallback if Cloudflare begins challenging server-side requests.
 - **Namespace migration**: Switch the namespace to `datacat` once Sigma retires its built-in DataCat (change `PROVIDER_ID` + manifest `extNamespace`) and migrate cards linked under `datacat-plus` to `datacat` (rewrite `data.extensions.datacat-plus` -> `datacat` through `ctx.stores.characters`) so nothing imported in the meantime is orphaned.

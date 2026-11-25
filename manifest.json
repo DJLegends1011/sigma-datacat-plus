@@ -1,7 +1,7 @@
 {
     "id": "datacat-plus",
     "name": "DataCat Plus",
-    "version": "0.0.1",
+    "version": "0.1.0",
     "author": "DJLegends",
     "description": "DataCat (datacat.run) as a character source, with DataCat account sync: Yours/collections, folders and Following. Rebuilt as an extension from Character Library's DataCat provider. Switch off Sigma's built-in DataCat while this is on.",
     "requires": { "api": "2.7" },
