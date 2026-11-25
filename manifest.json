@@ -18,6 +18,7 @@
         "datacatSyncYours": true,
         "datacatUseAccountForExtraction": true,
         "datacatFollowedCreators": [],
-        "datacatFollowMigrated": false
+        "datacatFollowMigrated": false,
+        "datacatBlockedTags": []
     }
 }

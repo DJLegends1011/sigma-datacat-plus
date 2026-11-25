@@ -254,6 +254,53 @@ test('a collection add with ?collect=1 collects first, in one trip from the page
     assert.deepEqual(steps(), [`DELETE /api/user-folders/12/items/${charId}`]);
 });
 
+test('blocked tags read and write the account list, keeping its creators and hiding parts', async () => {
+    const aliceExt = alice.ext('datacat-plus');
+    const bobExt = bob.ext('datacat-plus');
+    let stored = {
+        success: true, authenticated: true,
+        configured: { tags: true, creators: true, hiding: true },
+        tags: [{ id: 100517, label: 'Cultivation', slug: 'cultivation' }],
+        creators: [{ id: '11111111-2222-3333-4444-555555555555', sourceKind: 'janitor' }],
+        hiding: { excludeLowTokens: true, minTotalTokens: 1000 },
+    };
+    let putBody = null;
+    datacatResponder = (url, init) => {
+        if (url.endsWith('/api/auth/verify')) return jsonResp({ success: true, valid: true, user: { uuid: 'u-alice' } });
+        if (url.endsWith('/api/user-preferences/character-filters')) {
+            if ((init?.method || 'GET') === 'PUT') {
+                putBody = JSON.parse(init.body);
+                stored = { ...stored, ...putBody };
+                return jsonResp({ success: true });
+            }
+            return jsonResp(stored);
+        }
+        return jsonResp({ error: 'unexpected ' + url }, 500);
+    };
+
+    const read = await aliceExt('/dc-blocked-tags');
+    assert.equal(read.status, 200);
+    assert.deepEqual(read.body, { ok: true, configured: true, tags: [{ id: 100517, label: 'Cultivation', slug: 'cultivation' }] });
+
+    const save = await aliceExt('/dc-blocked-tags', 'PUT', { tags: [{ id: 414, label: 'combat', slug: 'combat' }, { id: 414 }, { id: 'x' }] });
+    assert.equal(save.status, 200);
+    // only the tags part changes; creators and hiding go back as DataCat had them
+    assert.deepEqual(putBody.tags, [{ id: 414, label: 'combat', slug: 'combat' }]);
+    assert.deepEqual(putBody.creators, [{ id: '11111111-2222-3333-4444-555555555555', sourceKind: 'janitor' }]);
+    assert.deepEqual(putBody.hiding, { excludeLowTokens: true, minTotalTokens: 1000 });
+
+    const tooMany = await aliceExt('/dc-blocked-tags', 'PUT', { tags: Array.from({ length: 51 }, (_, i) => ({ id: i + 1 })) });
+    assert.equal(tooMany.status, 400);
+    const notList = await aliceExt('/dc-blocked-tags', 'PUT', { tags: 'nsfw' });
+    assert.equal(notList.status, 400);
+
+    // bob has no DataCat account session: refused, nothing sent upstream
+    upstreamCalls.length = 0;
+    const bobRead = await bobExt('/dc-blocked-tags');
+    assert.notEqual(bobRead.status, 200);
+    assert.equal(upstreamCalls.filter(c => c.url.includes('user-preferences')).length, 0);
+});
+
 test('/dc-proxy/*splat forwards allowed paths, passes 403 Turnstile through, blocks disallowed paths and off-origin redirects', async () => {
     const aliceExt = alice.ext('datacat-plus');
 

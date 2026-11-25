@@ -69,3 +69,19 @@ test('a drop during a save is saved afterwards; a refusal rolls back to the conf
 test('a picker write that lands after a reopen does not sync the new list', () => {
     assert.match(picker, /if \(token === _renderToken\) syncMainRowFromFolders\(characterId\)/);
 });
+
+// tag blocking (DataCat's own block list)
+test('the Tags rows are Sigma\'s tri-state buttons; CL\'s include-only cycleTagState is gone', () => {
+    assert.match(browse, /\$\{tagStateButtonHtml\(tagState\(tag\.id\)\)\}/);
+    // deferred past the click, or Sigma's outside-click check closes the dropdown (the clicked icon is detached)
+    assert.match(browse, /setTimeout\(\(\) => updateTagStateButton\(stateBtn, next\), 0\)/);
+    assert.doesNotMatch(browse, /function cycleTagState|cycleTagState\(/);
+});
+
+test('blocked tags reach DataCat on the feeds that take them, and hide the rest by name', () => {
+    assert.match(api, /path \+= `&blockedTagIds=\$\{blocked\.join\(','\)\}`/);
+    assert.match(browse, /blockedTagIds: blockedTagIdList\(\),\n\s+search: datacatSearchQuery/);
+    assert.match(browse, /tagIds: \[\.\.\.datacatActiveTagIds\],\n\s+blockedTagIds: blockedTagIdList\(\),/);
+    assert.match(browse, /fetchFacetedTags\(\{ activeTagIds: \[\.\.\.datacatActiveTagIds\], blockedTagIds: blockedTagIdList\(\) \}\)/);
+    assert.equal((browse.match(/filter\(c => !isDatacatRowBlocked\(c\)\)/g) || []).length, 2);
+});

@@ -179,6 +179,28 @@ async function testDcToken(token, deviceToken) {
 }
 
 // Read-only API paths forwarded by /dc-proxy.
+// DataCat's list queries take at most 50 blockedTagIds
+export const DC_BLOCKED_TAGS_MAX = 50;
+
+/**
+ * A blocked-tag list in DataCat's shape ({ id, label, slug }, ids positive integers, no repeats).
+ * @returns {Array<{id: number, label: string, slug: string|null}>|null} null when it isn't a list or is too long
+ */
+export function normalizeDcBlockedTags(list) {
+    if (!Array.isArray(list)) return null;
+    const seen = new Set();
+    const out = [];
+    for (const t of list) {
+        const id = parseInt(String(t && typeof t === 'object' ? t.id : t), 10);
+        if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+        seen.add(id);
+        const label = String((t && typeof t === 'object' && (t.label || t.name)) || '').trim().slice(0, 120);
+        const slug = String((t && typeof t === 'object' && t.slug) || '').trim().slice(0, 120);
+        out.push({ id, label: label || `Tag #${id}`, slug: slug || null });
+    }
+    return out.length > DC_BLOCKED_TAGS_MAX ? null : out;
+}
+
 const DC_ALLOWED_PATHS = [
     /^\/api\/characters$/,
     /^\/api\/characters\/fresh\b/,
@@ -777,6 +799,51 @@ export function registerDataCatRoutes(router, ctx = null) {
             });
         } catch (err) {
             console.error('[datacat-plus] DC folder create error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
+        }
+    });
+
+    // ── Blocked tags: the account's own list (DataCat's site keeps it in
+    // /api/user-preferences/character-filters as { tags, creators, hiding }). A PUT there replaces
+    // the whole object, so a tag change reads it first and sends the other two parts back untouched.
+    router.get('/dc-blocked-tags', async (req, res) => {
+        const account = requireDcAccount(req, res);
+        if (!account) return;
+        try {
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, '/api/user-preferences/character-filters');
+            if (response.ok && data?.success) {
+                return res.json({ ok: true, configured: data.configured?.tags === true, tags: normalizeDcBlockedTags(data.tags) || [] });
+            }
+            return res.status(response.status || 502).json({ error: formatDcError(response, data, rawText, 'DataCat blocked tags') });
+        } catch (err) {
+            console.error('[datacat-plus] DC blocked tags read error:', err.message);
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
+        }
+    });
+
+    router.put('/dc-blocked-tags', async (req, res) => {
+        const account = requireDcAccount(req, res);
+        if (!account) return;
+        const tags = normalizeDcBlockedTags(req.body?.tags);
+        if (!tags) return res.status(400).json({ error: `A list of at most ${DC_BLOCKED_TAGS_MAX} tags is required` });
+        try {
+            const current = await fetchDcAccountEndpoint(account, '/api/user-preferences/character-filters');
+            if (!(current.response.ok && current.data?.success)) {
+                return res.status(current.response.status || 502).json({
+                    error: formatDcError(current.response, current.data, current.rawText, 'DataCat filter preferences'),
+                });
+            }
+            const keep = current.data;
+            const body = {
+                tags,
+                ...(Array.isArray(keep.creators) ? { creators: keep.creators } : {}),
+                ...(keep.hiding && typeof keep.hiding === 'object' ? { hiding: keep.hiding } : {}),
+            };
+            const { response, data, rawText } = await fetchDcAccountEndpoint(account, '/api/user-preferences/character-filters', { method: 'PUT', body, json: true });
+            if (response.ok && data?.success) return res.json({ ok: true, tags });
+            return res.status(response.status || 502).json({ error: formatDcError(response, data, rawText, 'DataCat blocked tags save') });
+        } catch (err) {
+            console.error('[datacat-plus] DC blocked tags save error:', err.message);
             return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
         }
     });

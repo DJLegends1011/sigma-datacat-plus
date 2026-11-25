@@ -474,6 +474,16 @@ export async function reorderDatacatFolders(folderIds) {
  * @param {{collect?: boolean}} [opts] collect: save it to the account first, in the same server trip
  *   (DataCat refuses a collection for a character not collected yet); the answer then carries `collected`
  */
+/** The signed-in account's blocked tags (DataCat's own list, shared with the site). */
+export async function fetchDatacatBlockedTags() {
+    return dcAccountJson(`${DC_EXT_BASE}/dc-blocked-tags`);
+}
+
+/** Replace the account's blocked tags ({ id, label, slug }[], at most 50). */
+export async function saveDatacatBlockedTags(tags) {
+    return dcAccountJson(`${DC_EXT_BASE}/dc-blocked-tags`, 'PUT', { tags });
+}
+
 export async function setDatacatFolderMembership(folderId, characterId, member, { collect = false } = {}) {
     const path = buildDatacatFolderItemPath(folderId, characterId);
     if (!path) return { ok: false, error: 'Invalid DataCat folder or character id' };
@@ -594,7 +604,7 @@ export function isDatacatYoursSavedHit(hit, savedOverride = null) {
     return DATACAT_YOURS_SAVED_FLAGS.some(key => hit[key] === true);
 }
 
-export function buildDatacatYoursCharactersPath({ limit = 80, offset = 0, minTotalTokens = MIN_TOTAL_TOKENS, tagIds = [] } = {}) {
+export function buildDatacatYoursCharactersPath({ limit = 80, offset = 0, minTotalTokens = MIN_TOTAL_TOKENS, tagIds = [], blockedTagIds = [] } = {}) {
     const params = new URLSearchParams();
     params.set('limit', String(Math.max(1, Number(limit) || 80)));
     params.set('offset', String(Math.max(0, Number(offset) || 0)));
@@ -603,6 +613,8 @@ export function buildDatacatYoursCharactersPath({ limit = 80, offset = 0, minTot
         ? tagIds.map(id => parseInt(String(id), 10)).filter(id => Number.isFinite(id) && id > 0)
         : [];
     if (cleanTagIds.length > 0) params.set('tagIds', cleanTagIds.join(','));
+    const cleanBlocked = normalizeDatacatIdList(blockedTagIds);
+    if (cleanBlocked.length > 0) params.set('blockedTagIds', cleanBlocked.join(','));
     params.set('sort', 'added');
     return `/api/characters?${params.toString()}`;
 }
@@ -777,9 +789,11 @@ export async function fetchDatacatYoursCharacters(opts = {}) {
  * @returns {Promise<{totalCount: number, characters: Object[]}>} failures throw classified errors
  */
 export async function fetchRecentPublic(opts = {}) {
-    const { limit = 24, offset = 0, tagIds = [], search = '', sortBy = '', minTotalTokens = MIN_TOTAL_TOKENS } = opts;
+    const { limit = 24, offset = 0, tagIds = [], blockedTagIds = [], search = '', sortBy = '', minTotalTokens = MIN_TOTAL_TOKENS } = opts;
     let path = `/api/characters/recent-public?limit=${limit}&offset=${offset}&summary=1&minTotalTokens=${minTotalTokens}`;
     if (tagIds.length > 0) path += `&tagIds=${tagIds.join(',')}`;
+    const blocked = normalizeDatacatIdList(blockedTagIds);
+    if (blocked.length > 0) path += `&blockedTagIds=${blocked.join(',')}`;
     if (search) path += `&search=${encodeURIComponent(search)}`;
     if (sortBy) path += `&sortBy=${encodeURIComponent(sortBy)}`;
     const response = await dcFetch(path);
@@ -817,10 +831,13 @@ export async function fetchFreshCharacters(opts = {}) {
  * @returns {Promise<{groups: Object[], tags: Object[]}|null>}
  */
 export async function fetchFacetedTags(opts = {}) {
-    const { activeTagIds = [], minTotalTokens = MIN_TOTAL_TOKENS } = opts;
+    const { activeTagIds = [], blockedTagIds = [], minTotalTokens = MIN_TOTAL_TOKENS } = opts;
     try {
         let path = `/api/tags/faceted?mode=recent&minTotalTokens=${minTotalTokens}`;
         if (activeTagIds.length > 0) path += `&activeTagIds=${activeTagIds.join(',')}`;
+        // counts as the grid sees them; a blocked tag itself stays listed so it can be unblocked
+        const blocked = normalizeDatacatIdList(blockedTagIds);
+        if (blocked.length > 0) path += `&blockedTagIds=${blocked.join(',')}`;
         const response = await dcFetch(path);
         if (!response.ok) return null;
         const data = await response.json();

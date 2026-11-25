@@ -9,6 +9,7 @@ import {
     BrowseView, renderViewToggle, updateNsfwToggleButton, renderFeatureFilterItems, setFilterCount,
     featureFilterState, libraryFeatureRows, activeFeatureRows, featurePasses, countActiveFeatures,
     browseCardImageWidth, cardTagsHtml, libraryBadgeHtml, libraryCardClass,
+    tagStateButtonHtml, updateTagStateButton,
 } from '/modules/providers/browse-view.js';
 import CoreAPI from '/modules/core-api.js';
 import { IMG_PLACEHOLDER, formatNumber, BROWSE_PURIFY_CONFIG, skeletonLines, deferRender, deferCall, isMobileMode, renderBrowseError } from '/modules/providers/provider-utils.js';
@@ -47,6 +48,8 @@ import {
     isDatacatYoursCollectableHit,
     isDatacatYoursSavedHit,
     JANNY_TAG_MAP,
+    fetchDatacatBlockedTags,
+    saveDatacatBlockedTags,
     pickRecoveryVariant,
     stripDatacatMarkers,
 } from './datacat-api.js';
@@ -67,10 +70,16 @@ let datacatAccountLoggedIn = false;
 
 export function setDatacatBrowseSettings(settings) {
     _settings = settings;
+    // the local block list lives in settings: read it once they arrive
+    datacatBlockedLoaded = false;
+    if (settings) void syncDatacatBlockedTags();
 }
 
 export function setDatacatAccountLoggedIn(loggedIn) {
+    const changed = datacatAccountLoggedIn !== !!loggedIn;
     datacatAccountLoggedIn = !!loggedIn;
+    // signing in swaps the local block list for the account's; signing out goes back to the local one
+    if (changed || !datacatBlockedLoaded) void syncDatacatBlockedTags();
 }
 
 function getDcSetting(key) {
@@ -150,6 +159,105 @@ let datacatNsfwEnabled = false;
 
 // Faceted tag filtering
 let datacatActiveTagIds = new Set();
+
+// Blocked tags ({ id, label, slug } by id). Signed in, this is the account's own list, the one
+// DataCat's site keeps (so the site and other devices block the same tags); signed out, a local
+// setting, which the first sign-in carries up when the account has none, as DataCat's site does.
+// Recent and Collected feeds drop blocked characters on DataCat's side (blockedTagIds); Fresh,
+// creator, Following and the JanitorAI sorts ignore that parameter, so those cards are hidden here
+// by tag name (their rows carry tags and customTags).
+const DATACAT_BLOCKED_MAX = 50; // DataCat's limit on blockedTagIds
+let datacatBlockedTags = new Map();
+let datacatBlockedKeys = new Set();
+let datacatBlockedLoaded = false;
+let datacatBlockedSaveTimer = null;
+let datacatBlockedSyncToken = 0;
+
+const tagMatchKey = (s) => String(s || '')
+    .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}\uFE0F\u200D]/gu, '')
+    .toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+
+function normalizeBlockedList(list) {
+    if (!Array.isArray(list)) return [];
+    const seen = new Set();
+    const out = [];
+    for (const t of list) {
+        const id = parseInt(String(t?.id ?? t), 10);
+        if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+        seen.add(id);
+        out.push({ id, label: String(t?.label || t?.name || '').trim() || `Tag #${id}`, slug: String(t?.slug || '').trim() || null });
+    }
+    return out.slice(0, DATACAT_BLOCKED_MAX);
+}
+
+function setBlockedTags(list) {
+    const ids = () => [...datacatBlockedTags.keys()].sort((a, b) => a - b).join(',');
+    const before = ids();
+    datacatBlockedTags = new Map(normalizeBlockedList(list).map(t => [t.id, t]));
+    datacatBlockedKeys = new Set();
+    for (const t of datacatBlockedTags.values()) {
+        for (const k of [tagMatchKey(t.slug), tagMatchKey(t.label)]) if (k) datacatBlockedKeys.add(k);
+    }
+    return before !== ids();
+}
+
+function blockedTagIdList() {
+    return [...datacatBlockedTags.keys()];
+}
+
+/** Whether a row carries a blocked tag (site tags, the creator's customTags / custom_tags, or names). */
+export function isDatacatRowBlocked(row) {
+    if (!datacatBlockedKeys.size || !row) return false;
+    const names = [];
+    for (const t of row.tags || []) names.push(typeof t === 'string' ? t : t?.slug, typeof t === 'string' ? '' : t?.name);
+    for (const t of row.customTags || row.custom_tags || []) names.push(typeof t === 'string' ? t : t?.slug || t?.name);
+    for (const t of row.tagNames || []) names.push(t);
+    return names.some(n => datacatBlockedKeys.has(tagMatchKey(n)));
+}
+
+async function syncDatacatBlockedTags() {
+    if (!_settings) return; // switched off or not started: nothing to read or redraw
+    const token = ++datacatBlockedSyncToken;
+    const local = normalizeBlockedList(getDcSetting('datacatBlockedTags'));
+    let changed;
+    if (!datacatAccountLoggedIn) {
+        changed = setBlockedTags(local);
+    } else {
+        const res = await fetchDatacatBlockedTags().catch(() => null);
+        if (token !== datacatBlockedSyncToken) return;
+        if (!res?.ok) {
+            // the account list didn't answer: keep blocking what this device knows
+            changed = setBlockedTags(local);
+        } else if (!res.configured && local.length) {
+            changed = setBlockedTags(local);
+            scheduleBlockedSave();
+        } else {
+            changed = setBlockedTags(res.tags || []);
+            setDcSetting('datacatBlockedTags', [...datacatBlockedTags.values()]);
+        }
+    }
+    datacatBlockedLoaded = true;
+    if (!changed) return;
+    updateTagsButton();
+    if (datacatTagsLoaded && !isJannyTagMode()) renderTagsList(document.getElementById('datacatTagsSearchInput')?.value || '');
+    if (delegatesInitialized && datacatCharacters.length) {
+        datacatCurrentOffset = 0;
+        loadCharacters(false);
+    }
+}
+
+function scheduleBlockedSave() {
+    setDcSetting('datacatBlockedTags', [...datacatBlockedTags.values()]);
+    if (!datacatAccountLoggedIn) return;
+    clearTimeout(datacatBlockedSaveTimer);
+    // a burst of clicks is one save, as DataCat's site batches it
+    datacatBlockedSaveTimer = setTimeout(async () => {
+        datacatBlockedSaveTimer = null;
+        const res = await saveDatacatBlockedTags([...datacatBlockedTags.values()]).catch(err => ({ ok: false, error: err.message }));
+        if (!res?.ok) showToast(`Couldn't save blocked tags to your DataCat account: ${res?.error || 'unknown error'}`, 'error');
+    }, 450);
+}
+
 let datacatTagGroups = [];
 let datacatTags = [];
 let datacatTagsLoaded = false;
@@ -595,6 +703,8 @@ function filterDatacatCharacters(characters) {
     let filtered = datacatNsfwEnabled
         ? characters
         : characters.filter(c => !isNsfw(c));
+    // the feeds DataCat can't block on its side (Fresh, creator, JanitorAI sorts) carry their tags
+    if (datacatBlockedKeys.size) filtered = filtered.filter(c => !isDatacatRowBlocked(c));
 
     const activeRows = activeFeatureRows(DATACAT_FEATURE_FILTERS, datacatFeatureState);
     if (activeRows.length) {
@@ -744,6 +854,7 @@ async function loadCharacters(append = false) {
                 limit: PAGE_SIZE,
                 offset: datacatCurrentOffset,
                 tagIds: [...datacatActiveTagIds],
+                blockedTagIds: blockedTagIdList(),
             };
             const folderOptions = buildDatacatYoursFolderFetchOptions(datacatYoursFolderSel, common);
             const data = folderOptions
@@ -762,6 +873,7 @@ async function loadCharacters(append = false) {
                     limit: PAGE_SIZE,
                     offset: datacatCurrentOffset,
                     tagIds: tagIds.length > 0 ? tagIds : undefined,
+                    blockedTagIds: blockedTagIdList(),
                     search: datacatSearchQuery || undefined,
                     // recent-public honors only sortBy=score, so Score sorts survive tag/search
                     // filtering; the other fresh sorts fall back to newest-first on this path
@@ -994,7 +1106,7 @@ async function loadFacetedTags() {
     const container = document.getElementById('datacatTagsList');
     if (container) container.innerHTML = '<div class="browse-tags-loading"><i class="fa-solid fa-spinner fa-spin"></i> Loading tags...</div>';
     try {
-        const data = await fetchFacetedTags({ activeTagIds: [...datacatActiveTagIds] });
+        const data = await fetchFacetedTags({ activeTagIds: [...datacatActiveTagIds], blockedTagIds: blockedTagIdList() });
         if (!data) {
             if (container) container.innerHTML = '<div class="browse-tags-empty">Failed to load tags</div>';
             return;
@@ -1014,7 +1126,7 @@ async function loadFacetedTags() {
 
 async function refreshTagCounts() {
     try {
-        const data = await fetchFacetedTags({ activeTagIds: [...datacatActiveTagIds] });
+        const data = await fetchFacetedTags({ activeTagIds: [...datacatActiveTagIds], blockedTagIds: blockedTagIdList() });
         if (!data) return;
         datacatTags = data.tags || [];
         renderTagsList(document.getElementById('datacatTagsSearchInput')?.value || '');
@@ -1027,7 +1139,10 @@ function renderTagsList(filter = '') {
     const container = document.getElementById('datacatTagsList');
     if (!container) return;
 
-    if (datacatTags.length === 0) {
+    // blocked tags stay listed even when the faceted list leaves them out (blocked, they count 0),
+    // so there is always a row to unblock one from
+    const listTags = datacatTagsForList();
+    if (listTags.length === 0) {
         container.innerHTML = '<div class="browse-tags-empty">No tags available</div>';
         return;
     }
@@ -1040,16 +1155,13 @@ function renderTagsList(filter = '') {
         return name.includes(filterLower) || slug.includes(filterLower);
     };
 
+    const tagState = (id) => (datacatActiveTagIds.has(id) ? 'include' : datacatBlockedTags.has(id) ? 'exclude' : 'neutral');
     const buildRow = (tag) => {
-        const active = datacatActiveTagIds.has(tag.id);
-        const stateClass = active ? 'state-include' : 'state-neutral';
-        const stateIcon = active ? '<i class="fa-solid fa-plus"></i>' : '';
-        const stateTitle = active ? 'Active: click to remove' : 'Click to filter';
         const countStr = tag.count != null ? ` (${formatNumber(tag.count)})` : '';
         const cleanName = (tag.name || tag.slug || '').replace(/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\u200D]+\s*/u, '').trim() || tag.name;
         return `
             <div class="browse-tag-filter-item" data-tag-id="${tag.id}">
-                <button class="browse-tag-state-btn ${stateClass}" title="${stateTitle}">${stateIcon}</button>
+                ${tagStateButtonHtml(tagState(tag.id))}
                 <span class="tag-label">${escapeHtml(cleanName)}${countStr}</span>
             </div>
         `;
@@ -1060,7 +1172,7 @@ function renderTagsList(filter = '') {
 
     let html = '';
     for (const group of sortedGroups) {
-        const groupTags = datacatTags
+        const groupTags = listTags
             .filter(t => t.groupId === group.id && matchesFilter(t))
             .sort((a, b) => (b.count || 0) - (a.count || 0));
         if (groupTags.length === 0) continue;
@@ -1071,11 +1183,11 @@ function renderTagsList(filter = '') {
     // The catalog is ~76k tags and everything outside the curated groups is ungrouped, so the
     // tail renders through the same chunked window the library tag popup uses: only a slice
     // is in the DOM and scrolling near the bottom appends the next one. Active tags pin first.
-    const ungrouped = datacatTags
+    const ungrouped = listTags
         .filter(t => !groupIds.has(t.groupId) && matchesFilter(t))
         .sort((a, b) => {
-            const aActive = datacatActiveTagIds.has(a.id) ? 0 : 1;
-            const bActive = datacatActiveTagIds.has(b.id) ? 0 : 1;
+            const aActive = datacatActiveTagIds.has(a.id) || datacatBlockedTags.has(a.id) ? 0 : 1;
+            const bActive = datacatActiveTagIds.has(b.id) || datacatBlockedTags.has(b.id) ? 0 : 1;
             if (aActive !== bActive) return aActive - bActive;
             return (b.count || 0) - (a.count || 0);
         });
@@ -1109,21 +1221,36 @@ function renderTagsList(filter = '') {
         const item = e.target.closest('.browse-tag-filter-item');
         if (!item || !container.contains(item)) return;
         const tagId = Number(item.dataset.tagId);
-        const tag = datacatTags.find(t => t.id === tagId);
+        const tag = listTags.find(t => t.id === tagId);
         const group = tag ? datacatTagGroups.find(g => g.id === tag.groupId) : null;
+        const state = datacatActiveTagIds.has(tagId) ? 'include' : datacatBlockedTags.has(tagId) ? 'exclude' : 'neutral';
 
-        if (datacatActiveTagIds.has(tagId)) {
-            datacatActiveTagIds.delete(tagId);
-        } else {
+        // Sigma's cycle: neutral -> include -> exclude (blocked) -> neutral
+        let next = state === 'neutral' ? 'include' : state === 'include' ? 'exclude' : 'neutral';
+        if (next === 'exclude' && datacatBlockedTags.size >= DATACAT_BLOCKED_MAX) {
+            showToast(`DataCat blocks at most ${DATACAT_BLOCKED_MAX} tags; unblock one first`, 'info');
+            next = 'neutral';
+        }
+        datacatActiveTagIds.delete(tagId);
+        if (next === 'include') {
             if (group?.exclusive) {
-                for (const otherTag of datacatTags.filter(t => t.groupId === group.id)) {
-                    datacatActiveTagIds.delete(otherTag.id);
-                }
+                for (const otherTag of listTags.filter(t => t.groupId === group.id)) datacatActiveTagIds.delete(otherTag.id);
             }
             datacatActiveTagIds.add(tagId);
         }
+        const blockedBefore = datacatBlockedTags.has(tagId);
+        if (next === 'exclude' && !blockedBefore) {
+            const label = (tag?.name || tag?.slug || '').replace(/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\u200D]+\s*/u, '').trim();
+            setBlockedTags([...datacatBlockedTags.values(), { id: tagId, label, slug: tag?.slug || null }]);
+        } else if (next !== 'exclude' && blockedBefore) {
+            setBlockedTags([...datacatBlockedTags.values()].filter(t => t.id !== tagId));
+        }
+        if (blockedBefore !== datacatBlockedTags.has(tagId)) scheduleBlockedSave();
 
-        cycleTagState(item.querySelector('.browse-tag-state-btn'), datacatActiveTagIds.has(tagId));
+        // after the click finishes: swapping the icon now would detach the clicked <i>, and Sigma's
+        // outside-click check (BrowseView._registerDropdownDismiss) would then close the dropdown
+        const stateBtn = item.querySelector('.browse-tag-state-btn');
+        setTimeout(() => updateTagStateButton(stateBtn, next), 0);
         updateTagsButton();
         datacatCurrentOffset = 0;
         loadCharacters(false);
@@ -1131,17 +1258,13 @@ function renderTagsList(filter = '') {
     };
 }
 
-function cycleTagState(btn, active) {
-    btn.className = 'browse-tag-state-btn';
-    if (active) {
-        btn.classList.add('state-include');
-        btn.innerHTML = '<i class="fa-solid fa-plus"></i>';
-        btn.title = 'Active: click to remove';
-    } else {
-        btn.classList.add('state-neutral');
-        btn.innerHTML = '';
-        btn.title = 'Click to filter';
-    }
+/** The Tags list: DataCat's faceted tags plus any blocked tag the list left out. */
+function datacatTagsForList() {
+    const have = new Set(datacatTags.map(t => t.id));
+    const missing = [...datacatBlockedTags.values()]
+        .filter(b => !have.has(b.id))
+        .map(b => ({ id: b.id, name: b.label, slug: b.slug, groupId: null, count: null }));
+    return missing.length ? [...datacatTags, ...missing] : datacatTags;
 }
 
 function updateTagsButton() {
@@ -1150,9 +1273,10 @@ function updateTagsButton() {
 
     // Sigma's count badge (it also feeds the phone's overflow label); a Hampter sort sends no
     // tags, so the greyed button counts none there
+    // blocked tags count too: they shape every feed, the JanitorAI sorts included (by tag name)
     const count = isHampterSortMode(datacatSortMode) ? 0 : isJannyTagMode()
-        ? jannyActiveTagIds.size
-        : datacatActiveTagIds.size;
+        ? jannyActiveTagIds.size + datacatBlockedTags.size
+        : datacatActiveTagIds.size + datacatBlockedTags.size;
     setFilterCount(btn, 'Tags', count);
 }
 
@@ -1211,12 +1335,9 @@ function renderJannyTagsList(filter = '') {
 
     container.innerHTML = filtered.map(tag => {
         const included = jannyActiveTagIds.has(tag.id);
-        const stateClass = included ? 'state-include' : 'state-neutral';
-        const stateIcon = included ? '<i class="fa-solid fa-plus"></i>' : '';
-        const stateTitle = included ? 'Included: click to remove' : 'Click to include';
         return `
             <div class="browse-tag-filter-item" data-tag-id="${tag.id}">
-                <button class="browse-tag-state-btn ${stateClass}" title="${stateTitle}">${stateIcon}</button>
+                ${tagStateButtonHtml(included ? 'include' : 'neutral')}
                 <span class="tag-label">${escapeHtml(tag.name)}</span>
             </div>
         `;
@@ -1231,7 +1352,8 @@ function renderJannyTagsList(filter = '') {
                 jannyActiveTagIds.add(tagId);
             }
             const btn = item.querySelector('.browse-tag-state-btn');
-            cycleTagState(btn, jannyActiveTagIds.has(tagId));
+            const jannyState = jannyActiveTagIds.has(tagId) ? 'include' : 'neutral';
+            setTimeout(() => updateTagStateButton(btn, jannyState), 0); // see the DataCat list: keep the clicked icon attached
             updateTagsButton();
             if (isHampterSortMode(datacatSortMode)) hampterCurrentPage = 1;
             if (isJannySortMode(datacatSortMode)) meiliCurrentPage = 1;
@@ -2532,6 +2654,7 @@ function renderFollowing(append = false) {
     let filtered = datacatNsfwEnabled
         ? source
         : source.filter(c => !isNsfw(c));
+    if (datacatBlockedKeys.size) filtered = filtered.filter(c => !isDatacatRowBlocked(c));
 
     const activeRows = activeFeatureRows(DATACAT_FEATURE_FILTERS, datacatFeatureState);
     if (activeRows.length) {
