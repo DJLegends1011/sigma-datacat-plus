@@ -186,6 +186,7 @@ let _hooks = {
 };
 const _folderLoader = createDatacatFolderLoader(fetchDatacatFolders);
 let _openEl = null; // the picker's list element while open
+let _keyboardFit = null; // the keyboard tracker while the picker is open on a phone
 let _openCharId = '';
 let _openCharName = '';
 let _renderToken = 0;
@@ -238,7 +239,52 @@ function ensureModal() {
     return modal;
 }
 
+/**
+ * STOPGAP until Sigma's drawers follow the phone keyboard (reported to Reaper 2026-11-25).
+ * library.html sets interactive-widget=overlays-content, so the keyboard covers the page instead of
+ * shrinking it, and a cl-modal-drawer stays under it: half the list on first open, the whole drawer
+ * after switching apps and back. Only Sigma's mobile search overlay corrects for it, by lifting
+ * itself by window.innerHeight - visualViewport.height (library-mobile.js ~1665); this does the same
+ * for this one drawer, and re-measures when the page becomes visible again. Public browser APIs only;
+ * does nothing on desktop or without visualViewport. Remove once Sigma's drawer does it.
+ */
+function stopgapFitDrawerAboveKeyboard(modal) {
+    const vv = window.visualViewport;
+    if (!vv || !modal || !document.documentElement.classList.contains('cl-mobile')) return null;
+    const content = modal.querySelector('.cl-modal-content');
+    const sync = () => {
+        const keyboard = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+        modal.style.bottom = keyboard > 0 ? `${keyboard}px` : '';
+        // the drawer's own cap is 75vh of the full screen: keep it inside what the keyboard leaves
+        // (Sigma's drawer rule is !important, so the inline cap must be too)
+        if (content) {
+            if (keyboard > 0) content.style.setProperty('max-height', `${Math.max(160, Math.round(vv.height * 0.9))}px`, 'important');
+            else content.style.removeProperty('max-height');
+        }
+    };
+    // after a tab-out Chrome restores the keyboard without a resize the drawer heard: measure again
+    const later = () => { sync(); setTimeout(sync, 250); };
+    const onVisible = () => { if (document.visibilityState === 'visible') later(); };
+    vv.addEventListener('resize', sync);
+    vv.addEventListener('scroll', sync);
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', later);
+    modal.addEventListener('focusin', later);
+    sync();
+    return () => {
+        vv.removeEventListener('resize', sync);
+        vv.removeEventListener('scroll', sync);
+        document.removeEventListener('visibilitychange', onVisible);
+        window.removeEventListener('focus', later);
+        modal.removeEventListener('focusin', later);
+        modal.style.bottom = '';
+        content?.style.removeProperty('max-height');
+    };
+}
+
 export function closeDatacatFolderPicker() {
+    _keyboardFit?.();
+    _keyboardFit = null;
     document.getElementById(MODAL_ID)?.classList.remove('visible');
     _openEl = null;
     _openCharId = '';
@@ -472,5 +518,6 @@ export async function openDatacatFolderPicker({ anchor, characterId, characterNa
     const search = document.getElementById('datacatFolderPickerSearch');
     if (search) search.value = '';
     modal.classList.add('visible');
+    _keyboardFit = stopgapFitDrawerAboveKeyboard(modal);
     await loadAndRender(id);
 }

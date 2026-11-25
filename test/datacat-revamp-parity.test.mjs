@@ -90,3 +90,11 @@ test('a pending blocked-tags save is dropped on sign-out or switch-off', () => {
     assert.match(browse, /if \(!datacatAccountLoggedIn \|\| !_settings \|\| forAccount !== datacatBlockedSyncToken\) return;/);
     assert.match(browse, /if \(!settings\) \{ clearTimeout\(datacatBlockedSaveTimer\)/);
 });
+
+test('phone: the picker drawer is lifted above the keyboard (stopgap) and undone on close', () => {
+    assert.match(picker, /function stopgapFitDrawerAboveKeyboard\(modal\)/);
+    assert.match(picker, /window\.innerHeight - vv\.height - vv\.offsetTop/);
+    assert.match(picker, /addEventListener\('visibilitychange', onVisible\)/);
+    assert.match(picker, /_keyboardFit = stopgapFitDrawerAboveKeyboard\(modal\)/);
+    assert.match(picker, /_keyboardFit\?\.\(\);\n\s+_keyboardFit = null;/);
+});
