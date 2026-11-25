@@ -2052,7 +2052,7 @@ function startModalExtractionPolling(charId, source = 'janitor') {
                 if (completedEntry.success !== false && completedEntry.status !== 'error') {
                     if (importBtn) importBtn.innerHTML = '<i class="fa-solid fa-check-circle"></i> Done! Loading...';
                     updateInlineExtractionCTA('done');
-                    showToast('Extraction complete! Loading character...', 'success');
+                    showToast('Extraction complete, loading the character', 'success');
                     await new Promise(r => setTimeout(r, 1000));
                     try {
                         const character = await fetchDatacatCharacter(charId, source);
@@ -3253,6 +3253,8 @@ function closePreviewModal() {
     const modal = document.getElementById('datacatCharModal');
     if (modal) modal.classList.add('hidden');
     datacatSelectedChar = null;
+    // Sigma's view stops restamping a preview that is gone
+    view?.trackPreview(null);
 }
 
 // ========================================
@@ -4097,7 +4099,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                         <button id="datacatClearSearchBtn" class="browse-search-clear hidden" title="Clear search">
                             <i class="fa-solid fa-xmark"></i>
                         </button>
-                        <button id="datacatSearchBtn" class="browse-search-submit">
+                        <button id="datacatSearchBtn" class="browse-search-submit" aria-label="Search">
                             <i class="fa-solid fa-arrow-right"></i>
                         </button>
                     </div>
@@ -4119,7 +4121,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                         <span>Browsing characters by <strong id="datacatCreatorBannerName">Creator</strong></span>
                     </div>
                     <div class="browse-author-banner-actions">
-                        <select id="datacatCreatorSortSelect" class="glass-select" title="Sort creator's characters">
+                        <select id="datacatCreatorSortSelect" class="glass-select datacat-creator-sort-select" title="Sort creator's characters">
                             ${CREATOR_SORT_OPTIONS.map(o => `<option value="${o.value}" data-icon="${o.icon}">${o.label}</option>`).join('')}
                         </select>
                         <button id="datacatFollowCreatorBtn" class="glass-btn" title="Follow this creator" style="display: none;">
