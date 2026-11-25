@@ -29,6 +29,13 @@
 .browse-feature-badge.source-saucepan {
     color: #f4b860;
 }
+.browse-feature-badge.source-datacat {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 800;
+    font-size: var(--font-sm);
+    line-height: 1;
+    color: var(--cl-success);
+}
 .browse-feature-badge.source-saucepan:hover {
     color: #f7c97f;
 }

@@ -50,6 +50,9 @@ import {
     JANNY_TAG_MAP,
     fetchDatacatBlockedTags,
     saveDatacatBlockedTags,
+    datacatSourceOf,
+    datacatDetailHint,
+    isDatacatDirectUpload,
     pickRecoveryVariant,
     stripDatacatMarkers,
 } from './datacat-api.js';
@@ -390,7 +393,8 @@ function isCharPossibleMatchObj(c) {
  * @returns {'janitor'|'saucepan'}
  */
 function getSourceKind(hit) {
-    return hit?.primary_content_source_kind === 'saucepan' ? 'saucepan' : 'janitor';
+    // 'datacat' = a card published on DataCat (direct_upload), neither JanitorAI nor Saucepan
+    return datacatSourceOf(hit);
 }
 
 function isDatacatYoursSyncEnabled() {
@@ -599,6 +603,8 @@ function createDatacatCard(hit) {
     // CL-only: the Saucepan "S" badge, no Saucepan source in Sigma
     if (!isSingleSourceMode && sourceKind === 'janitor') {
         sourceBadges.push('<span class="browse-feature-badge source-janitor" title="Source: JanitorAI">J</span>');
+    } else if (!isSingleSourceMode && sourceKind === 'datacat') {
+        sourceBadges.push('<span class="browse-feature-badge source-datacat" title="Published on DataCat">DC</span>');
     }
 
     const nsfwBadge = isNsfw(hit) ? '<span class="browse-nsfw-badge">NSFW</span>' : '';
@@ -2941,7 +2947,7 @@ async function fetchAndPopulateDetails(hit, token) {
     }
 
     // Start download fetch early (runs in parallel with character fetch)
-    const hitSource = getSourceKind(hit);
+    const hitSource = datacatDetailHint(hit);
     const downloadPromise = fetchDatacatDownload(charId, hitSource).catch(() => null);
 
     try {
@@ -3000,9 +3006,12 @@ async function fetchAndPopulateDetails(hit, token) {
         const saucepanBody = charIsSaucepan
             ? (recoveredVariant?.description || v2Data?.description || character.description || '')
             : '';
-        const personality = charIsSaucepan
-            ? saucepanBody
-            : (character.personality || recoveredVariant?.personality || stripDatacatMarkers(v2Data?.description) || '');
+        // a published card is the uploader's own V2: its description is the body, personality a summary
+        const personality = isDatacatDirectUpload(character)
+            ? (v2Data?.description || character.personality || '')
+            : charIsSaucepan
+                ? saucepanBody
+                : (character.personality || recoveredVariant?.personality || stripDatacatMarkers(v2Data?.description) || '');
         const scenario = recoveredVariant?.scenario || character.scenario || v2Data?.scenario || '';
         const firstMessage = recoveredVariant?.first_message || character.first_message || v2Data?.first_mes || '';
         const canPaintBody = !!recoveredVariant || !charIsSaucepan || !!saucepanBody;

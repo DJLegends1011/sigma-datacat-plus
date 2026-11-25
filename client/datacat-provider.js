@@ -29,6 +29,7 @@ import {
     checkDcPluginAvailable,
     buildV2FromDatacat,
     buildV2FromDownload,
+    datacatDetailHint,
     extractCharacterBookFromScripts,
     hydrateDatacatScripts,
     hasUnfetchedLorebook,
@@ -232,6 +233,12 @@ class DatacatProvider extends ProviderBase {
             if (!sourceKind) {
                 const probe = await fetchDatacatCharacter(linkInfo.id);
                 sourceKind = probe?.primary_content_source_kind || 'janitor';
+            }
+
+            // a card published on DataCat has no upstream page to re-extract: its detail is current
+            if (sourceKind === 'direct_upload') {
+                api?.debugLog?.('[DatacatProvider] refreshRemoteData: published on DataCat, nothing to re-extract');
+                return;
             }
 
             const upstreamUrl = sourceKind === 'saucepan'
@@ -456,9 +463,7 @@ class DatacatProvider extends ProviderBase {
 
             // Download-first for the best V2 mapping; the sourceKind hint keeps freshly-extracted chars from 404ing into the metadata fallback.
             let characterCard;
-            const sourceKind = character.primary_content_source_kind
-                ? (character.primary_content_source_kind === 'saucepan' ? 'saucepan' : 'janitor')
-                : null;
+            const sourceKind = character.primary_content_source_kind ? datacatDetailHint(character) : null;
             const downloadData = await fetchDatacatDownload(charId, sourceKind);
             // Listing-shaped hits carry no body source at all; the metadata build needs the full row.
             if (!downloadData?.data && !character.chara_card_v2_json && !character.content_variants && !character.personality) {

@@ -41,6 +41,30 @@ export const DATACAT_API_BASE = 'https://datacat.run';
 //   - Saucepan: full https URL (cdn.saucepan.ai/...) embedded in the avatar field
 // Future sources should be added here. Use resolveDatacatAvatarUrl() to get a usable URL.
 export const DATACAT_JANITOR_IMAGE_BASE = 'https://ella.janitorai.com/bot-avatars/';
+export const DATACAT_SITE_BASE = 'https://datacat.run';
+
+// primary_content_source_kind values seen 2026-11-25: janitor_core and jannyai (JanitorAI cards),
+// saucepan, and direct_upload ("DC Published": a card uploaded to DataCat itself, a complete V2
+// card in chara_card_v2_json, no JanitorAI creator, its avatar on datacat.run's own media).
+export function isDatacatDirectUpload(row) {
+    return row?.primary_content_source_kind === 'direct_upload';
+}
+
+/** A row's source for the UI: 'saucepan', 'datacat' (published on DataCat) or 'janitor'. */
+export function datacatSourceOf(row) {
+    const kind = row?.primary_content_source_kind;
+    if (kind === 'saucepan') return 'saucepan';
+    if (kind === 'direct_upload') return 'datacat';
+    return 'janitor';
+}
+
+/** The sourceKind hint the detail and download endpoints take (a JanitorAI hint 404s a published card). */
+export function datacatDetailHint(row) {
+    const kind = row?.primary_content_source_kind;
+    if (kind === 'saucepan') return 'saucepan';
+    if (kind === 'direct_upload') return 'direct_upload';
+    return 'janitor';
+}
 
 /**
  * Resolve a character's avatar URL based on its source.
@@ -66,7 +90,10 @@ export function resolveDatacatAvatarUrl(hit, opts = {}) {
         : [hit?.avatar];
     for (const avatar of candidates) {
         if (!avatar || typeof avatar !== 'string') continue;
-        let url = /^https?:\/\//i.test(avatar) ? avatar : `${DATACAT_JANITOR_IMAGE_BASE}${avatar}`;
+        // a published card's avatar is a signed path on datacat.run itself; JanitorAI's are bare filenames
+        let url = /^https?:\/\//i.test(avatar) ? avatar
+            : avatar.startsWith('/') ? `${DATACAT_SITE_BASE}${avatar}`
+                : `${DATACAT_JANITOR_IMAGE_BASE}${avatar}`;
         const safety = CoreAPI.isUrlSafeForDownload(url);
         if (!safety.ok) continue;
         // Grid cards pass a width to pull a thumbnail: janitorai's raw bot-avatars are full-size
@@ -1049,8 +1076,52 @@ export function extractCharacterBookFromScripts(character) {
  * @param {Object} character - Character object from /api/characters/:id
  * @returns {Object} V2-spec character card { spec, spec_version, data }
  */
+/**
+ * A card published on DataCat (direct_upload): its chara_card_v2_json.data is the uploader's own
+ * V2 card, so every field keeps its V2 meaning (JanitorAI rows keep the body in `personality` and
+ * the blurb in `description`, which buildV2FromDatacat remaps). Falls back to the row's flat fields.
+ */
+function buildV2FromDatacatPublished(character) {
+    const v2 = character?.chara_card_v2_json?.data || {};
+    const pick = (...vals) => vals.find(v => typeof v === 'string' && v.trim()) || '';
+    const tagSeen = new Set();
+    const tagNames = resolveTagNames([...(Array.isArray(v2.tags) ? v2.tags : []), ...(character.tags || []), ...(character.custom_tags || [])])
+        .filter(t => { const k = t.toLowerCase(); if (tagSeen.has(k)) return false; tagSeen.add(k); return true; });
+    const altGreetings = [v2.alternate_greetings, character.alternate_greetings].find(a => Array.isArray(a) && a.length) || [];
+    const creator = pick(v2.creator, character.creator_name, character.creatorName);
+    return {
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        data: {
+            name: pick(v2.name, character.chat_name, character.chatName, character.name) || 'Unknown',
+            description: pick(v2.description),
+            personality: pick(v2.personality, character.personality),
+            scenario: pick(v2.scenario, character.scenario),
+            first_mes: pick(v2.first_mes, character.first_message),
+            mes_example: pick(v2.mes_example),
+            system_prompt: pick(v2.system_prompt),
+            post_history_instructions: pick(v2.post_history_instructions),
+            creator_notes: pick(v2.creator_notes, character.description),
+            creator,
+            character_version: pick(v2.character_version) || '1.0',
+            tags: tagNames,
+            alternate_greetings: altGreetings,
+            extensions: {
+                [PROVIDER_ID]: {
+                    id: character.character_id || character.characterId,
+                    sourceKind: 'direct_upload',
+                    creatorId: null,
+                    creatorName: creator || null,
+                },
+            },
+            character_book: (v2.character_book && typeof v2.character_book === 'object') ? v2.character_book : (extractCharacterBookFromScripts(character) || undefined),
+        },
+    };
+}
+
 export function buildV2FromDatacat(character) {
     if (!character) return null;
+    if (isDatacatDirectUpload(character)) return buildV2FromDatacatPublished(character);
 
     // DataCat's tags, then the creator's own custom_tags, as Sigma's JanitorAI import keeps them (buildV2FromJanitorai)
     const tagSeen = new Set();
@@ -1131,6 +1202,8 @@ export function buildV2FromDatacat(character) {
  * @returns {Object|null}
  */
 export function buildV2FromDownload(downloadData, character) {
+    // a published card's detail already is the uploader's own V2 card: no JanitorAI field mapping
+    if (character && isDatacatDirectUpload(character) && character.chara_card_v2_json?.data) return buildV2FromDatacatPublished(character);
     const d = downloadData?.data;
     if (!d) return null;
 
