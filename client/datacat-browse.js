@@ -1173,7 +1173,7 @@ function updateTagsVisibility() {
     const off = isHampterSortMode(datacatSortMode);
     btn.disabled = off;
     btn.classList.toggle('browse-option-disabled', off);
-    btn.title = off ? 'Not available with JanitorAI Hampter sorts' : 'Tag filters';
+    btn.title = off ? 'Not available with JanitorAI sorts' : 'Tag filters';
     if (off) document.getElementById('datacatTagsDropdown')?.classList.add('hidden');
 }
 
@@ -1303,7 +1303,7 @@ function isKnownSortMode(mode) {
 }
 
 function buildSortOptionsHtml(selected) {
-    let html = `<option value="recent" data-icon="fa-solid fa-clock-rotate-left" ${selected === 'recent' ? 'selected' : ''}>Recent</option>`;
+    let html = `<option value="recent" data-icon="fa-solid fa-clock" ${selected === 'recent' ? 'selected' : ''}>Recent</option>`;
     html += '<optgroup label="Last 24 Hours">';
     for (const o of FRESH_SORT_LABELS) {
         const val = `${o.value}_24h`;
@@ -2606,7 +2606,7 @@ function openPreviewModal(hit) {
     const charId = getCharId(hit);
     const name = hit.name || 'Unknown';
     // Modal header renders ~150px; a thumbnail avoids decoding the full janitorai original on open
-    const avatarUrl = resolveDatacatAvatarUrl(hit, { width: 600 }) || '/img/ai4.png';
+    const avatarUrl = resolveDatacatAvatarUrl(hit, { width: 600 }) || '/img/no-portrait.png';
     const tags = resolveTagNames(hit.tags || []);
     const creatorName = getCreatorName(hit) || 'Unknown';
     const inLibrary = isCharInLocalLibrary(hit);
@@ -2625,7 +2625,7 @@ function openPreviewModal(hit) {
     avatarImg.src = avatarUrl;
     // Full-res (no width param) for the avatar viewer; the square itself stays a thumbnail
     avatarImg.dataset.full = resolveDatacatAvatarUrl(hit, { preferOriginal: true }) || avatarUrl;
-    avatarImg.onerror = () => { avatarImg.src = '/img/ai4.png'; };
+    avatarImg.onerror = () => { avatarImg.src = '/img/no-portrait.png'; };
     BrowseView.adjustPortraitPosition(avatarImg);
     document.getElementById('datacatCharName').textContent = name;
     document.getElementById('datacatCharCreator').textContent = creatorName;
@@ -3289,7 +3289,7 @@ async function importCharacter(charData) {
             const dupeBody = getSourceKind(character) === 'saucepan'
                 ? (dupeRecovered?.description || dupeRecovered?.personality || dupeV2?.description || character.description || '')
                 : (character.personality || dupeRecovered?.personality || stripDatacatMarkers(dupeV2?.description) || '');
-            const avatarUrl = resolveDatacatAvatarUrl(character) || resolveDatacatAvatarUrl(charData) || '/img/ai4.png';
+            const avatarUrl = resolveDatacatAvatarUrl(character) || resolveDatacatAvatarUrl(charData) || '/img/no-portrait.png';
             return {
                 data: character,
                 probe: {
@@ -3760,7 +3760,7 @@ function ensureModalEventsAttached() {
         avatar.addEventListener('click', (e) => {
             if (isMobileMode()) return;
             e.stopPropagation();
-            if (!avatar.src || avatar.src.endsWith('/img/ai4.png')) return;
+            if (!avatar.src || avatar.src.endsWith('/img/no-portrait.png')) return;
             BrowseView.openAvatarViewer(avatar.dataset.full || avatar.src, avatar.src);
         });
     }
@@ -4183,7 +4183,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         <div class="modal-glass browse-char-modal">
             <div class="modal-header">
                 <div class="browse-char-header-info">
-                    <img id="datacatCharAvatar" src="/img/ai4.png" alt="" class="browse-char-avatar" decoding="async">
+                    <img id="datacatCharAvatar" src="/img/no-portrait.png" alt="" class="browse-char-avatar" decoding="async">
                     <div>
                         <h2 id="datacatCharName">Character Name</h2>
                         <p class="browse-char-meta">

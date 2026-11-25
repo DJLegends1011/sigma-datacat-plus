@@ -33,6 +33,11 @@ test('Load More containers are hidden by the attribute updateLoadMoreVisibility 
     assert.doesNotMatch(browse, /LoadMore"[^>]*style="display: none;"/);
 });
 
+test('portrait fallbacks use an image Sigma ships (/img/ai4.png 404s in Sigma 1.3.1)', () => {
+    assert.doesNotMatch(browse, /\/img\/ai4\.png/);
+    assert.match(browse, /\/img\/no-portrait\.png/);
+});
+
 test('provider row keeps core\'s enableWarning; JanitorAI tokens are not client settings', () => {
     assert.match(index, /enableWarning: '/);
     assert.ok(!('datacatJanitoraiToken' in manifest.settings));

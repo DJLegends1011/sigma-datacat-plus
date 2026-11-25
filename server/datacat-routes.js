@@ -17,7 +17,10 @@ import {
 const DATACAT_BASE = 'https://datacat.run';
 export const T_SESSIONS = 'x_datacat_plus_sessions';
 const DC_PROXY_REDIRECT_LIMIT = 3;
-const DC_PROXY_MAX_BYTES = 8 * 1024 * 1024; // the largest DataCat JSON page seen is well under 1 MB
+// Sigma's own DataCat proxy relays through relayUpstream with PROVIDER_RELAY_MAX_BYTES, 50 MiB
+// (server/lib/net-guard.js:187, services/shared.js:108). DataCat's /api/tags/faceted alone answered
+// 9,610,899 bytes on 2026-11-24, so a smaller cap empties the Tags dropdown.
+const DC_PROXY_MAX_BYTES = 50 * 1024 * 1024;
 
 function dcHeaders(token, options = {}) {
     return buildDataCatHeaders({

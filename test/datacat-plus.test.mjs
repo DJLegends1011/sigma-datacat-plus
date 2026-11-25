@@ -234,12 +234,16 @@ test('/dc-proxy answers are sandboxed and size-capped; no route echoes a token',
     const aliceExt = alice.ext('datacat-plus');
     datacatResponder = (url) => {
         if (url.includes('/api/characters/recent-public')) return textResp('<script>alert(1)</script>', 200);
-        if (url.includes('/api/tags/faceted')) return jsonResp({ big: 'x'.repeat(9 * 1024 * 1024) });
+        // DataCat's real faceted-tags answer is ~9.6 MB (2026-11-24): it must pass; past Sigma's 50 MiB is refused
+        if (url.includes('/api/tags/faceted') && url.includes('size=real')) return jsonResp({ big: 'x'.repeat(10 * 1024 * 1024) });
+        if (url.includes('/api/tags/faceted')) return jsonResp({ big: 'x'.repeat(51 * 1024 * 1024) });
         return jsonResp({ error: 'unexpected' }, 500);
     };
     const html = await alice.apiRequest('/ext/datacat-plus/dc-proxy/api/characters/recent-public?limit=1');
     assert.equal(html.status, 200);
     assert.equal(html.headers.get('content-security-policy'), 'sandbox');
+    const real = await alice.apiRequest('/ext/datacat-plus/dc-proxy/api/tags/faceted?size=real');
+    assert.equal(real.status, 200);
     const big = await aliceExt('/dc-proxy/api/tags/faceted');
     assert.equal(big.status, 502);
     assert.match(big.body.error, /byte limit/);
