@@ -99,7 +99,7 @@ test('phone: the picker drawer is lifted above the keyboard (stopgap) and undone
     assert.match(picker, /_keyboardFit\?\.\(\);\n\s+_keyboardFit = null;/);
 });
 
-test('dispose closes the picker (and its keyboard listeners)', () => {
-    const ix = fs.readFileSync(new URL('../client/index.js', import.meta.url), 'utf8');
+test('dispose closes the picker (and its keyboard listeners)', async () => {
+    const ix = await read('../client/index.js');
     assert.match(ix, /dispose\(\) \{[\s\S]*?closeDatacatFolderPicker\(\);[\s\S]*?\n    \},/);
 });
