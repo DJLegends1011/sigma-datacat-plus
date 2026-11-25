@@ -22,6 +22,34 @@ const DC_PROXY_REDIRECT_LIMIT = 3;
 // 9,610,899 bytes on 2026-11-24, so a smaller cap empties the Tags dropdown.
 const DC_PROXY_MAX_BYTES = 50 * 1024 * 1024;
 
+/**
+ * Read an upstream body, giving up as soon as it passes `maxBytes` (a missing or wrong
+ * content-length can't make the server hold more than the cap).
+ * @returns {Promise<{buffer: Buffer|null, size: number}>} buffer is null past the cap; size is what was seen
+ */
+export async function readDcBodyCapped(response, maxBytes) {
+    const declared = Number(response.headers.get('content-length'));
+    if (declared > maxBytes) {
+        await response.body?.cancel().catch(() => {});
+        return { buffer: null, size: declared };
+    }
+    if (!response.body) return { buffer: Buffer.alloc(0), size: 0 };
+    const reader = response.body.getReader();
+    const parts = [];
+    let size = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxBytes) {
+            await reader.cancel().catch(() => {});
+            return { buffer: null, size };
+        }
+        parts.push(value);
+    }
+    return { buffer: Buffer.concat(parts, size), size };
+}
+
 function dcHeaders(token, options = {}) {
     return buildDataCatHeaders({
         sessionToken: token,
@@ -1001,13 +1029,9 @@ export function registerDataCatRoutes(router, ctx = null) {
 
             const contentType = response.headers.get('content-type') || '';
             // capped, and sandboxed so an upstream HTML/SVG answer never runs same-origin in Sigma
-            const declared = Number(response.headers.get('content-length'));
-            if (declared > DC_PROXY_MAX_BYTES) {
-                return res.status(502).json({ error: `DataCat answered ${declared} bytes, over the ${DC_PROXY_MAX_BYTES} byte limit` });
-            }
-            const buffer = Buffer.from(await response.arrayBuffer());
-            if (buffer.length > DC_PROXY_MAX_BYTES) {
-                return res.status(502).json({ error: `DataCat answered ${buffer.length} bytes, over the ${DC_PROXY_MAX_BYTES} byte limit` });
+            const { buffer, size } = await readDcBodyCapped(response, DC_PROXY_MAX_BYTES);
+            if (!buffer) {
+                return res.status(502).json({ error: `DataCat answered ${size} bytes, over the ${DC_PROXY_MAX_BYTES} byte limit` });
             }
             res.status(response.status);
             res.set('Content-Security-Policy', 'sandbox');
