@@ -1,25 +1,21 @@
 # DataCat Plus
 
-A [Project Σ](https://github.com/Sillyanonymous/ProjectSigma) provider extension for [DataCat](https://datacat.run). It brings Character Library's full DataCat browser into Sigma: DataCat, JanitorAI and Hampter search, cloud extraction, your DataCat account's collections and follows, tag blocking that syncs with the site, and missing-avatar restore. It uses Sigma's own UI on desktop and phone.
+**Browse [DataCat](https://datacat.run) inside [Project Σ](https://github.com/Sillyanonymous/ProjectSigma) and import its characters with one click.** If you have a DataCat account, your collections, follows and blocked tags work here too, the same as on the site. It looks and works like Σ's other online sources, on desktop and phone.
 
 ![DataCat Plus: browse, tags, preview and Add to Collection](docs/media/walkthrough.gif)
 
-> **Beta.** Report problems on the GitHub issues page.
+> **Beta, and made by a community member, not the Σ team.** Read the "What it touches" section below before you install. Report problems on the GitHub issues page.
 
-## Features
+## What it does
 
-- **Browse and search:** DataCat's Recent and Fresh feeds, JanitorAI search, and Hampter's sorts. Also creator pages, a Following tab, SFW/NSFW, Sigma's feature filters, and "in library" badges on cards you already have.
-- **Every tag DataCat has:** creators' custom tags show in the preview and stay on the card you import. In the Tags dropdown, each tag cycles **include → block → clear**.
-- **Blocking synced with your account:** signed in, the tags you block go to your DataCat block list, the one datacat.run itself uses. The site and your other devices then hide the same tags.
-- **Cards published on DataCat:** cards uploaded straight to DataCat ("DC Published", marked **DC**) preview and import complete, lorebook included.
-- **Collections:**
-  - **Add to Collection** uses Sigma's own Add to Playlist picker: tick or untick collections, or type a name to create one.
-  - Each row shows a spinner until DataCat confirms the save.
-  - On a phone it's a bottom drawer that stays above the keyboard.
-  - A **Collected** view and a drag-to-reorder collection order in settings.
-- **Cloud extraction:** fetches cards whose definitions are hidden, using your account if you choose.
-- **Update checks:** imported cards can be checked for changes, as with Sigma's other providers.
-- **Missing avatars:** a restore tool finds lost avatars again.
+- **Browse and search DataCat:** the Recent and Fresh feeds, creator pages, the people you follow, SFW/NSFW, and Σ's usual filters. Cards you already have are marked "in library".
+- **Also searches JanitorAI listings** (through Σ's own JannyAI search) and Hampter's sorts.
+- **Every tag DataCat has:** the creator's own tags show in the preview and stay on the card you import. In the Tags list, tap a tag to include it, again to block it, again to clear it.
+- **Blocked tags follow your account:** signed in, a tag you block here is blocked on datacat.run and your other devices too.
+- **Collections:** tap the heart on a character, tick the collections it goes in, or type a name to make a new one. Each row spins until DataCat confirms the save. There's a **Collected** view, and you can drag your collections into order in settings.
+- **Hidden definitions:** for a card whose definition is hidden, it can ask DataCat to extract it (with your account, if you choose).
+- **Cards published on DataCat** (marked **DC**) import complete, lorebook included.
+- **Update checks** and a **missing-avatar restore**, as with Σ's other sources.
 
 | Tags: include and block | Add to Collection |
 |---|---|
@@ -33,29 +29,40 @@ A [Project Σ](https://github.com/Sillyanonymous/ProjectSigma) provider extensio
 
 ## Install
 
-1. In Sigma, open **Settings > Extensions**. Paste `https://github.com/DJLegends1011/sigma-datacat-plus` and press **Install**. Or download the zip from [Releases](https://github.com/DJLegends1011/sigma-datacat-plus/releases) and use **Install from a File**.
-2. Turn **DataCat Plus** on.
-3. In **Settings > Online**, **switch off Sigma's built-in DataCat** to avoid duplicate provider tabs and DOM ID clashes.
-4. Optional: in the DataCat Plus section of **Settings > Online**, sign in with your DataCat account for collections, follows, synced blocking and account extraction.
+1. Read the source first: it's all in this repo, unminified.
+2. In Σ, open **Settings > Extensions**. Paste `https://github.com/DJLegends1011/sigma-datacat-plus` and press **Install**, or download the zip from [Releases](https://github.com/DJLegends1011/sigma-datacat-plus/releases) and use **Install from a File**.
+3. Turn **DataCat Plus** on.
+4. In **Settings > Online**, **turn off Σ's built-in DataCat**. Both at once would show two DataCat tabs that get in each other's way.
+5. Optional: in the DataCat Plus section of **Settings > Online**, sign in to your DataCat account for collections, follows, synced blocking and account extraction.
 
-Needs Sigma with extension API 2.7 or newer.
+Needs Σ with extension API 2.7 or newer.
 
-## Privacy, Storage & Network
+## What it touches, and what it sends
 
-- **What it reads**: Extension settings (`datacatNsfw`, `datacatPublicFeed`, `datacatReextractOnUpdate`, `datacatSyncYours`, `datacatUseAccountForExtraction`, `datacatFollowedCreators`, `datacatFollowMigrated`, `datacatBlockedTags`), your Sigma character list for in-library badges and avatar restore, and the app-wide `importMediaAction` setting.
-- **What it writes**: Its own server-side session/account storage table (per Sigma account) and its own extension settings under `datacat-plus`. Characters you import are saved through Sigma's normal character import pipeline with link metadata under `data.extensions[PROVIDER_ID]`.
-- **What it sends and where**:
-  - Browse, search, extraction, folder, and follow requests go to `datacat.run` (and `ella.janitorai.com` for avatars / JanitorAI MeiliSearch where selected) through this extension's server half at `/api/ext/datacat-plus/dc-*`.
-  - When you sign in to a DataCat account, your email and password are sent **only** in the POST body to `datacat.run` (`/api/auth/login`) via this extension's server half. The password input is cleared immediately after submission and is never stored. Account and anonymous session tokens are kept server-side only (never stored in client settings).
-  - **Blocked tags:** signed in to a DataCat account, the tags you block in the Tags dropdown are your account's own block list on `datacat.run` (`/api/user-preferences/character-filters`, the list DataCat's site uses), so the site and your other devices block the same tags; only its tags part is changed. Signed out, the list stays in this extension's settings. The blocked tag ids are also sent with browse requests (`blockedTagIds`).
-  - **JanitorAI login (optional, for the Hampter sorts):** the session you paste is stored server-side per Sigma account (table `x_datacat_plus_jai`), and the refresh token never leaves the server. The page asks `/api/ext/datacat-plus/jai-token` for a current, short-lived **access** token when it pages a Hampter sort, because that request runs in your browser (which holds JanitorAI's Cloudflare pass) and goes straight to JanitorAI. An earlier build kept the pair in client settings; on first start it is handed to the server and cleared from settings.
+**It has a server half** (code that runs on the computer hosting Σ, not just in the page). That half does two things: it passes your requests on to datacat.run (a web page can't call DataCat directly), and it keeps your DataCat and JanitorAI logins so they never sit in the page or in your settings.
+
+**Sends, and where:**
+- **To datacat.run:** everything you browse, search, extract, follow, collect or block, through the server half. When you sign in, your email and password go to DataCat's login once and are not saved anywhere; only the login DataCat hands back is kept.
+- **Your blocked tags,** when signed in, are saved to your DataCat account's block list (the one the site uses). Only the tags part of that list is changed. Signed out, they stay in this extension's settings. The blocked tags are also sent with each browse request so DataCat leaves those cards out.
+- **To JanitorAI (optional, only for Hampter's sorts):** if you paste your JanitorAI login cookie in settings, it's kept by the server half and only a short-lived pass is handed to the page, which talks to janitorai.com directly (it has to, because of JanitorAI's bot check). Renewing that login goes to JanitorAI's login service (supabase.co).
+- **Pictures** (character avatars) load straight from datacat.run, ella.janitorai.com or saucepan.ai, like any web image.
+- Nothing is sent anywhere else, and nothing is sent to the extension's author.
+
+**Writes:**
+- Two tables of its own in Σ's database, one row per Σ account: your DataCat session (a guest one for browsing, plus your login if you sign in) and your JanitorAI login. **Log Out** in settings clears the saved login.
+- Its own settings (NSFW, followed creators, blocked tags when signed out, and so on).
+- Characters you import, saved through Σ's normal import like any other source, with a link back to their DataCat page.
+
+**Reads:** its own settings, your character list (for the "in library" marks and the avatar restore), and Σ's "what to do with card images on import" setting.
+
+Turning it off stops it. It does not undo imports or account changes it already made (collections, follows, blocked tags live on your DataCat account).
 
 ## Licence
 
-**AGPL-3.0** — derived from [Character Library](https://github.com/Sillyanonymous/SillyTavern-CharacterLibrary) (Sillyanonymous and contributors) and DJLegends' DataCat branch (`codex/datacat-account-sync`).
+**AGPL-3.0.** Built from [Character Library](https://github.com/Sillyanonymous/SillyTavern-CharacterLibrary)'s DataCat provider (Sillyanonymous and contributors) and DJLegends' DataCat branch (`codex/datacat-account-sync`).
 
 ## Roadmap
 
-- **Public collections:** browse other people's DataCat collections, once Sigma's collections extension is out.
-- **Hosted-browser fallback:** if Cloudflare starts challenging server-side requests.
-- **Namespace migration:** switch to `datacat` once Sigma retires its built-in DataCat (`PROVIDER_ID` + manifest `extNamespace`). Cards imported under `datacat-plus` are moved over through `ctx.stores.characters`, so none are orphaned.
+- **Public collections:** browse other people's DataCat collections, once Σ's collections extension is out.
+- **A fallback through Σ's hosted browser,** if DataCat's bot check ever starts blocking the server half.
+- **Taking over the `datacat` name** once Σ retires its built-in DataCat, moving cards you imported with Plus over so none lose their link.
