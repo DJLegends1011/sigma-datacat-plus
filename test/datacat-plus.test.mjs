@@ -234,6 +234,18 @@ test('a collection add with ?collect=1 collects first, in one trip from the page
     assert.equal(half.status, 500);
     assert.equal(half.body.collected, true);
 
+    // the folder call throws after the collect landed: the 502 still says collected
+    upstreamCalls.length = 0;
+    const before = datacatResponder;
+    datacatResponder = (url, init) => {
+        if (url.endsWith(`/api/user-folders/12/items/${charId}`)) throw new Error('socket hang up');
+        return before(url, init);
+    };
+    const thrown = await aliceExt(`/dc-folders/12/items/${charId}?collect=1`, 'PUT');
+    assert.equal(thrown.status, 502);
+    assert.equal(thrown.body.collected, true);
+    datacatResponder = before;
+
     // a removal never collects, even when asked to
     upstreamCalls.length = 0;
     folderStatus = 200;

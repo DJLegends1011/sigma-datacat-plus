@@ -875,7 +875,8 @@ export function registerDataCatRoutes(router, ctx = null) {
             });
         } catch (err) {
             console.error('[datacat-plus] DC folder membership error:', err.message);
-            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}` });
+            // a collect that landed before the folder call threw still counts: the page keeps Main ticked
+            return res.status(502).json({ error: `Failed to reach DataCat: ${err.message}`, ...(collected ? { collected: true } : {}) });
         }
     }
 

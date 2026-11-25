@@ -361,6 +361,8 @@ export function bindSettings(root, { settings, CoreAPI, signal }) {
     const orderList = $('dcPlusFolderOrderList');
     let folders = [];
     let saving = false;
+    let pendingSave = false; // a drop landed while a save was in flight: save again when it ends
+    let savedOrder = [];     // the order DataCat last confirmed, which a refusal rolls back to
     let orderLoadedFor = null;
 
     function showOrderStatus(message) {
@@ -379,26 +381,36 @@ export function bindSettings(root, { settings, CoreAPI, signal }) {
             </div>`).join('');
     }
 
+    const sameOrder = (a, b) => a.length === b.length && a.every((f, i) => String(f.id) === String(b[i]?.id));
+
     async function saveDroppedOrder() {
         const ids = [...orderList.querySelectorAll('.provider-order-item')].map(el => el.dataset.folderId);
-        const previous = [...folders];
         const byId = new Map(folders.map(f => [String(f.id), f]));
         folders = ids.map(id => byId.get(String(id))).filter(Boolean);
-        if (saving || previous.every((f, i) => String(f.id) === String(folders[i]?.id))) return;
+        if (saving) { pendingSave = true; return; }
+        if (sameOrder(folders, savedOrder)) return;
         saving = true;
         orderList.setAttribute('aria-busy', 'true');
         showOrderStatus('Saving the order to DataCat...');
+        const sending = [...folders];
         try {
-            const res = await datacatReorderFolders(folders.map(f => f.id));
+            const res = await datacatReorderFolders(sending.map(f => f.id));
             if (!res?.ok) throw new Error(res?.error || 'Could not save the collection order');
+            savedOrder = sending;
             showOrderStatus(null);
         } catch (err) {
-            folders = previous;
+            folders = [...savedOrder];
+            pendingSave = false;
             renderOrderList();
             showOrderStatus(err.message || 'Could not save the collection order');
         } finally {
             saving = false;
             orderList.removeAttribute('aria-busy');
+        }
+        // drops made while that save ran: send the order the list shows now
+        if (pendingSave) {
+            pendingSave = false;
+            await saveDroppedOrder();
         }
     }
     if (orderList) CoreAPI.wireDragReorder?.(orderList, { item: '.provider-order-item', handle: '.drag-handle', key: 'folderId', onReorder: saveDroppedOrder });
@@ -411,6 +423,7 @@ export function bindSettings(root, { settings, CoreAPI, signal }) {
             const res = await datacatGetSettingsFolders();
             if (!res?.ok) throw new Error(res?.error || 'Could not load your collections');
             folders = Array.isArray(res.folders) ? res.folders : [];
+            savedOrder = [...folders];
             showOrderStatus(folders.length ? null : 'No collections on this account yet.');
         } catch (err) {
             orderLoadedFor = null; // the next status check tries again
@@ -423,6 +436,7 @@ export function bindSettings(root, { settings, CoreAPI, signal }) {
     function clearOrderList() {
         orderLoadedFor = null;
         folders = [];
+        savedOrder = [];
         renderOrderList();
         showOrderStatus('Sign in to your DataCat account to reorder your collections.');
     }

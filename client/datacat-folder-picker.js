@@ -163,7 +163,18 @@ const { showToast, escapeHtml } = CoreAPI;
 // cl-modal drawer + pl-picker-* rows + the playlist-picker-modal phone layout, all styled by
 // app/modules/playlists.css. Those are core classes with no stability promise: after a Sigma
 // update, grep them in app/**/*.css (check-native-ui.mjs does) before shipping.
-const MODAL_ID = 'datacatFolderPickerModal';
+// The picker sits in Sigma's overlay stack (ctx.ui.addOverlay in index.js), which hands back the
+// element id to give it: Escape and a phone's back then close the picker before the preview.
+let MODAL_ID = 'datacatFolderPickerModal';
+
+/** index.js passes the id ctx.ui.addOverlay answered, before the picker first opens. */
+export function setDatacatFolderPickerModalId(id) {
+    if (id && !document.getElementById(MODAL_ID)) MODAL_ID = id;
+}
+
+export function isDatacatFolderPickerOpen() {
+    return !!document.getElementById(MODAL_ID)?.classList.contains('visible');
+}
 const MAIN_ID = '__main__';
 
 let _hooks = {
@@ -177,7 +188,6 @@ const _folderLoader = createDatacatFolderLoader(fetchDatacatFolders);
 let _openEl = null; // the picker's list element while open
 let _openCharId = '';
 let _openCharName = '';
-let _escHandler = null;
 let _renderToken = 0;
 
 export function initDatacatFolderPicker(hooks) {
@@ -230,10 +240,6 @@ function ensureModal() {
 
 export function closeDatacatFolderPicker() {
     document.getElementById(MODAL_ID)?.classList.remove('visible');
-    if (_escHandler) {
-        document.removeEventListener('keydown', _escHandler, true);
-        _escHandler = null;
-    }
     _openEl = null;
     _openCharId = '';
     _openCharName = '';
@@ -365,6 +371,7 @@ async function addToFolder(folderId, characterId) {
 
 async function toggleRow(row) {
     const characterId = _openCharId;
+    const token = _renderToken;
     const list = listEl();
     if (!row || !list || row.classList.contains('busy') || !characterId) return;
     const folderId = row.dataset.folderId;
@@ -409,7 +416,8 @@ async function toggleRow(row) {
         showToast(`DataCat collection update failed: ${err.message}`, 'error');
     } finally {
         setRowBusy(row, false);
-        syncMainRowFromFolders(characterId);
+        // closed, or reopened for another character, while DataCat answered: that list isn't this one
+        if (token === _renderToken) syncMainRowFromFolders(characterId);
     }
 }
 
@@ -463,14 +471,6 @@ export async function openDatacatFolderPicker({ anchor, characterId, characterNa
     document.getElementById('datacatFolderPickerCount').textContent = _openCharName;
     const search = document.getElementById('datacatFolderPickerSearch');
     if (search) search.value = '';
-    // Escape closes the picker first, not the preview beneath it
-    _escHandler = (e) => {
-        if (e.key !== 'Escape') return;
-        e.stopPropagation();
-        e.preventDefault();
-        closeDatacatFolderPicker();
-    };
-    document.addEventListener('keydown', _escHandler, true);
     modal.classList.add('visible');
     await loadAndRender(id);
 }

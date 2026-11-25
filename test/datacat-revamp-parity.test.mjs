@@ -52,3 +52,20 @@ test('D: a collection add collects on the same server trip and shows a spinner, 
 test('C: the preview lists the creator\'s custom tags after DataCat\'s, as Sigma\'s JanitorAI preview does', () => {
     assert.match(browse, /resolveTagNames\(\[\.\.\.\(character\.tags \|\| \[\]\), \.\.\.\(character\.custom_tags \|\| \[\]\)\]\)/);
 });
+
+// review of 8a01369 (F1, F2, F4)
+const index = await read('../client/index.js');
+
+test('the picker is in Sigma\'s overlay stack, so Escape and back close it before the preview', () => {
+    assert.match(index, /setDatacatFolderPickerModalId\(ctx\.ui\.addOverlay\(\{ id: 'folder-picker', close: closeDatacatFolderPicker, visible: isDatacatFolderPickerOpen \}\)\)/);
+    assert.doesNotMatch(picker, /_escHandler|document\.addEventListener\('keydown'/);
+});
+
+test('a drop during a save is saved afterwards; a refusal rolls back to the confirmed order', () => {
+    assert.match(settings, /if \(saving\) \{ pendingSave = true; return; \}/);
+    assert.match(settings, /folders = \[\.\.\.savedOrder\]/);
+});
+
+test('a picker write that lands after a reopen does not sync the new list', () => {
+    assert.match(picker, /if \(token === _renderToken\) syncMainRowFromFolders\(characterId\)/);
+});

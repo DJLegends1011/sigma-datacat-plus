@@ -15,6 +15,7 @@ import {
     disposeRestoreModal,
 } from './datacat-avatar-restore.js';
 import { PROVIDER_ID } from './datacat-id.js';
+import { closeDatacatFolderPicker, isDatacatFolderPickerOpen, setDatacatFolderPickerModalId } from './datacat-folder-picker.js';
 
 let _settingsAbort = null;
 
@@ -47,6 +48,8 @@ export default {
         ctx.ui.addOverlay({ id: 'preview', close: closePreviewModal, visible: isPreviewOpen });
         ctx.ui.addOverlay({ id: 'creator-banner', close: clearCreatorFilter, visible: isCreatorBannerOpen });
         ctx.ui.addOverlay({ id: 'avatar-restore', close: closeRestoreModal, visible: isRestoreModalOpen });
+        // the Add to Collection picker: it lies above the preview (z-index), so Escape and back close it first
+        setDatacatFolderPickerModalId(ctx.ui.addOverlay({ id: 'folder-picker', close: closeDatacatFolderPicker, visible: isDatacatFolderPickerOpen }));
 
         // Settings > Online > DataCat Plus: CL's DataCat section, ported in settings-panel.js.
         // The host reuses `el` across renders, so each render gets a fresh root and a fresh signal.
