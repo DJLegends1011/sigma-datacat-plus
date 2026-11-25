@@ -35,6 +35,8 @@ export default {
             icon: 'fa-solid fa-cat',
             iconUrl: 'https://datacat.run/catgif.gif',
             beta: true,
+            // core's DataCat row carries one; DataCat is still a rough, changing API
+            enableWarning: 'DataCat is an experimental source: its API is barebones and changes without notice, so some features (creator listings, search, extraction) may return incomplete results or fail.',
             avatarTap: { imgId: 'datacatCharAvatar', dataFull: true },
         });
 

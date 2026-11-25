@@ -418,7 +418,7 @@ html.cl-mobile .datacat-extract-actions {
     width: 100%;
 }
 
-html.cl-mobile .datacat-extract-actions .action-btn {
+html.cl-mobile .datacat-extract-actions .cl-btn {
     width: 100%;
     justify-content: center;
 }
@@ -676,47 +676,32 @@ html.cl-mobile .datacat-restore-name { font-size: var(--font-sm); }
 }
 .datacat-restore-actions { display: flex; gap: var(--space-sm); justify-content: flex-end; flex: 1; }
 
-/* The collection heart beside the creator in the preview header. From CL's
-   modules/providers/browse-shared.css (.browse-meta-action), which Sigma's shared sheet
-   doesn't carry; scoped to this preview so it can't restyle another provider's modal. */
-#datacatCharModal .browse-meta-action {
+/* The collection heart beside the creator in the preview header: shaped like Sigma's own
+   provider hearts (Chub's and Botbooru's site-scoped `*-favorite-btn-inline` beside
+   `browse-fav-toggle`, which the phone kebab menu reads), drawn with Sigma's tokens. It is a
+   <button> (it opens the collection picker), so the button chrome is reset first. */
+.datacat-favorite-btn-inline {
     appearance: none;
     border: 0;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 24px;
-    min-height: 24px;
-    padding: 3px 5px;
-    border-radius: var(--radius-sm);
-    color: inherit;
     font: inherit;
+    color: inherit;
     line-height: inherit;
+    vertical-align: baseline;
+    cursor: pointer;
+    padding: var(--space-2xs) var(--space-sm);
+    border-radius: var(--radius-sm);
     background: transparent;
-    vertical-align: middle;
-    transition: background 0.2s ease, opacity 0.2s ease;
+    transition: background var(--dur-base) ease, opacity var(--dur-base) ease;
 }
-
-#datacatCharModal .browse-meta-action:hover {
-    background: rgba(255, 100, 100, 0.15);
+.datacat-favorite-btn-inline:hover { background: rgba(255, 100, 100, 0.15); }
+.datacat-favorite-btn-inline i {
+    color: var(--cl-error-vivid);
+    transition: transform var(--dur-base) ease;
 }
-
-#datacatCharModal .browse-meta-action i {
-    color: #ff6b6b;
-    transition: transform 0.2s ease;
-}
-
-#datacatCharModal .browse-meta-action:hover i {
-    transform: scale(1.15);
-}
-
-#datacatCharModal .browse-meta-action.favorited {
-    background: rgba(255, 100, 100, 0.1);
-}
-
-#datacatCharModal .browse-meta-action:disabled,
-#datacatCharModal .browse-meta-action.loading {
+.datacat-favorite-btn-inline:hover i { transform: scale(1.15); }
+.datacat-favorite-btn-inline.favorited { background: rgba(255, 100, 100, 0.1); }
+.datacat-favorite-btn-inline:disabled,
+.datacat-favorite-btn-inline.loading {
     pointer-events: none;
     opacity: 0.6;
 }

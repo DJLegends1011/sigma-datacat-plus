@@ -5,7 +5,11 @@
 //   - JanitorAI MeiliSearch: text search + sort (activated via janny_* sort modes)
 //   - Extraction: cloud-browser extraction for JanitorAI-only characters
 
-import { BrowseView, renderViewToggle, updateNsfwToggleButton, renderFeatureFilterItems, setFilterCount } from '/modules/providers/browse-view.js';
+import {
+    BrowseView, renderViewToggle, updateNsfwToggleButton, renderFeatureFilterItems, setFilterCount,
+    featureFilterState, libraryFeatureRows, activeFeatureRows, featurePasses, countActiveFeatures,
+    browseCardImageWidth, cardTagsHtml, libraryBadgeHtml, libraryCardClass,
+} from '/modules/providers/browse-view.js';
 import CoreAPI from '/modules/core-api.js';
 import { IMG_PLACEHOLDER, formatNumber, BROWSE_PURIFY_CONFIG, skeletonLines, deferRender, deferCall, isMobileMode, renderBrowseError } from '/modules/providers/provider-utils.js';
 import { PROVIDER_ID } from './datacat-id.js';
@@ -102,6 +106,8 @@ let datacatCurrentOffset = 0;
 let datacatHasMore = true;
 let datacatIsLoading = false;
 let datacatLoadToken = 0;
+// set once the open preview's full detail has landed, so the import restamp may show a possible match
+let datacatPreviewDetailReady = false;
 let datacatSelectedChar = null;
 let datacatGridRenderedCount = 0;
 
@@ -124,14 +130,9 @@ let _returnToFollowing = false;
 let datacatSortMode = 'recent';
 let datacatCreatorSortMode = 'chat_count';
 
-let datacatFilterHideOwned = false;
-let datacatFilterHidePossible = false;
-let datacatFilterOnlyYours = false;
-let datacatFilterHideJanitor = false;
-let datacatFilterHideSaucepan = false;
 // "Collected" collection sub-filter: 'all' | 'main' | a custom folder id string.
 // Reset to 'all' whenever the Collected filter is turned off (see the
-// datacatFilterOnlyYours checkbox handler below).
+// datacatFeatureState.onlyYours checkbox handler below).
 let datacatYoursFolderSel = 'all';
 // Ordered custom folders returned by the provider layer. Re-fetched each time
 // the Only Yours filter is switched on so Settings order changes are reflected.
@@ -245,24 +246,28 @@ function isCharInLocalLibrary(dcChar) {
     return view ? view.isHitInLibrary(dcChar) : false;
 }
 
-// The Features dropdown rows, drawn by Sigma's renderFeatureFilterItems so the markup matches the
-// native providers; the checkboxes keep driving this view's own filter variables (wired by id).
+// The Features dropdown: Sigma's feature table, so the rows, their wiring (view.wireFeatureFilters),
+// the count badge and the saved Hide Owned / Hide Possible defaults (BrowseView.applyDefaults) all
+// run on Sigma's own code. Collected has no predicate: its scope comes from the server (the
+// collection routes), so loadCharacters and the filters below read its state directly.
 // CL-only: the Hide Saucepan row, no Saucepan source in Sigma.
-const DATACAT_FEATURE_ROWS = [
-    { key: 'onlyYours', id: 'datacatFilterOnlyYours', section: 'personal', icon: 'fa-heart', iconStyle: 'color: #e74c3c;', label: 'Collected' },
-    { key: 'hideOwned', id: 'datacatFilterHideOwned', section: 'library', icon: 'fa-check', label: 'Hide Owned Characters' },
-    { key: 'hidePossible', id: 'datacatFilterHidePossible', section: 'library', icon: 'fa-check', iconStyle: 'color: var(--cl-possible-match);', label: 'Hide Possible Matches' },
-    { key: 'hideJanitor', id: 'datacatFilterHideJanitor', section: 'source', icon: 'fa-cat', label: 'Hide JanitorAI' },
+const DATACAT_FEATURE_FILTERS = [
+    { key: 'onlyYours', id: 'datacatFilterOnlyYours', section: 'personal', icon: 'fa-heart', iconStyle: 'color: var(--cl-error-vivid);', label: 'Collected' },
+    ...libraryFeatureRows('datacat', () => view, (c) => isCharPossibleMatchObj(c)),
+    { key: 'hideJanitor', id: 'datacatFilterHideJanitor', section: 'source', icon: 'fa-cat', label: 'Hide JanitorAI',
+      exclude: (c) => getSourceKind(c) === 'janitor' },
 ];
+const datacatFeatureState = featureFilterState(DATACAT_FEATURE_FILTERS);
 const DATACAT_FILTER_SECTIONS = [
     { key: 'personal', title: 'Personal <span style="font-size: 0.8em; opacity: 0.6;">(requires login)</span>:' },
     { key: 'library', title: 'Library:' },
     { key: 'source', title: 'Source:', wrapId: 'datacatFilterSourceSection', noHr: true },
 ];
 
+// scored by the view's own hitMatchName, so the badge, the Hide Possible row and the import button agree
 function isCharPossibleMatchObj(c) {
-    if (isCharInLocalLibrary(c)) return false;
-    return !!(view?.getPossibleMatchTier?.(c.name || '', getCreatorName(c))?.show);
+    if (!view || view.isHitInLibrary(c)) return false;
+    return view.isHitPossibleMatch(c);
 }
 
 /**
@@ -350,7 +355,7 @@ function setDatacatFolderActionState(characterId, saved) {
     btn.setAttribute('aria-label', label);
 }
 function refreshDatacatOnlyYoursFilterIfActive() {
-    if (!datacatFilterOnlyYours) return;
+    if (!datacatFeatureState.onlyYours) return;
     if (datacatViewMode === 'following') {
         renderFollowing();
     } else {
@@ -384,9 +389,8 @@ let _folderControlFetchId = null;
 function setDatacatFolderBtnVisible(visible) {
     const btn = document.getElementById('datacatFolderBtn');
     const sep = document.getElementById('datacatFolderSep');
-    const val = visible ? '' : 'none';
-    if (btn && btn.style.display !== val) btn.style.display = val;
-    if (sep && sep.style.display !== val) sep.style.display = val;
+    if (btn && btn.hidden === visible) btn.hidden = !visible;
+    if (sep && sep.hidden === visible) sep.hidden = !visible;
 }
 function updateDatacatModalFolderControl(characterId, hit = null, { refresh = false } = {}) {
     const id = String(characterId || '').trim();
@@ -450,23 +454,23 @@ async function setDatacatMainMembership(characterId, saved, hit = null) {
 function createDatacatCard(hit) {
     const name = hit.name || 'Unknown';
     const desc = stripHtml(hit.description) || '';
-    // Grid cards render ~150px; request a thumbnail so janitorai originals dont decode full-size
-    const avatarUrl = resolveDatacatAvatarUrl(hit, { width: 400 }) || '/img/ai4.png';
+    // Sigma's card-slot width, so janitorai originals don't decode full-size into a ~260px slot
+    const avatarUrl = resolveDatacatAvatarUrl(hit, { width: browseCardImageWidth() }) || '/img/no-portrait.png';
     const charId = getCharId(hit);
     const creatorName = getCreatorName(hit);
-    const inLibrary = isCharInLocalLibrary(hit);
-    const possibleTier = inLibrary ? null : view.getPossibleMatchTier(hit.name || '', creatorName);
-    const possibleMatch = !!possibleTier?.show;
+    // library state from Sigma's view: In Library by the link key, possible match by hitMatchName
+    const inLibrary = view.isHitInLibrary(hit);
+    const possibleTier = inLibrary ? null : view.possibleMatchTierFor(hit);
 
-    // Tags are only present on creator endpoint items, not recent-public
-    const tags = resolveTagNames(hit.tags || []).slice(0, 3);
+    // Tags are only present on creator endpoint items, not recent-public; cardTagsHtml clamps them
+    const tags = resolveTagNames(hit.tags || []);
 
+    // Sigma's badges: an import in flight, then In Library / possible match
     const badges = [];
-    if (inLibrary) {
-        badges.push('<span class="browse-feature-badge in-library" title="In Your Library"><i class="fa-solid fa-check"></i></span>');
-    } else if (possibleMatch) {
-        badges.push(`<span class="browse-feature-badge possible-library pl-${possibleTier.tier}" title="${possibleTier.tooltip}"><i class="fa-solid fa-check"></i></span>`);
-    }
+    const importing = view.importingBadge(hit);
+    if (importing) badges.push(importing);
+    const libraryBadge = libraryBadgeHtml(inLibrary, possibleTier);
+    if (libraryBadge) badges.push(libraryBadge);
 
     const sourceBadges = [];
     const sourceKind = getSourceKind(hit);
@@ -479,12 +483,9 @@ function createDatacatCard(hit) {
         isJannySortMode(datacatSortMode)
         || isHampterSortMode(datacatSortMode)
     );
-    if (!isSingleSourceMode) {
-        if (sourceKind === 'saucepan') {
-            sourceBadges.push('<span class="browse-feature-badge source-saucepan" title="Source: Saucepan">S</span>');
-        } else if (sourceKind === 'janitor') {
-            sourceBadges.push('<span class="browse-feature-badge source-janitor" title="Source: JanitorAI">J</span>');
-        }
+    // CL-only: the Saucepan "S" badge, no Saucepan source in Sigma
+    if (!isSingleSourceMode && sourceKind === 'janitor') {
+        sourceBadges.push('<span class="browse-feature-badge source-janitor" title="Source: JanitorAI">J</span>');
     }
 
     const nsfwBadge = isNsfw(hit) ? '<span class="browse-nsfw-badge">NSFW</span>' : '';
@@ -513,11 +514,12 @@ function createDatacatCard(hit) {
         statsHtml = '';
     }
 
-    const cardClass = inLibrary ? 'browse-card in-library' : possibleMatch ? 'browse-card possible-library' : 'browse-card';
+    const cardClass = libraryCardClass(inLibrary, possibleTier);
+    // linkKeyAttr/matchAttr: the keys Sigma's badge heal re-reads when the library changes
     return `
-        <div class="${cardClass}" data-datacat-id="${escapeHtml(String(charId))}" ${desc ? `title="${escapeHtml(desc)}"` : ''}>
+        <div class="${cardClass}" data-datacat-id="${escapeHtml(String(charId))}"${view.linkKeyAttr(hit)}${view.matchAttr(hit)} ${desc ? `title="${escapeHtml(desc)}"` : ''}>
             <div class="browse-card-image">
-                <img data-src="${escapeHtml(avatarUrl)}" src="${IMG_PLACEHOLDER}" alt="${escapeHtml(name)}" decoding="async" fetchpriority="low" onerror="this.dataset.failed='1';this.src='/img/ai4.png'">
+                <img data-src="${escapeHtml(avatarUrl)}" src="${IMG_PLACEHOLDER}" alt="${escapeHtml(name)}" decoding="async" fetchpriority="low" onerror="this.dataset.failed='1';this.src='/img/no-portrait.png'">
                 ${nsfwBadge}
                 ${sourceBadges.length > 0 ? `<div class="browse-feature-badges browse-feature-badges-tl">${sourceBadges.join('')}</div>` : ''}
                 ${badges.length > 0 ? `<div class="browse-feature-badges">${badges.join('')}</div>` : ''}
@@ -525,9 +527,7 @@ function createDatacatCard(hit) {
             <div class="browse-card-body">
                 <div class="browse-card-name">${escapeHtml(name)}</div>
                 ${creatorName ? `<span class="browse-card-creator-link" data-creator-id="${escapeHtml(getCreatorId(hit))}" data-author="${escapeHtml(creatorName)}" title="Click to see all characters by ${escapeHtml(creatorName)}">${escapeHtml(creatorName)}</span>` : ''}
-                <div class="browse-card-tags">
-                    ${tags.map(t => `<span class="browse-card-tag" title="${escapeHtml(t)}">${escapeHtml(t)}</span>`).join('')}
-                </div>
+                ${cardTagsHtml(tags)}
             </div>
             <div class="browse-card-footer">
                 ${statsHtml}
@@ -583,7 +583,7 @@ function advanceDatacatPage() {
         // Mirrors isFreshMode: tag-filtered, searched, or Yours-filtered fresh sorts load via the
         // offset endpoint, so growing the fresh limits for them advanced nothing (the old stall) -
         // they ride the offset
-        if (parsed && !datacatFilterOnlyYours && datacatActiveTagIds.size === 0 && !datacatSearchQuery) {
+        if (parsed && !datacatFeatureState.onlyYours && datacatActiveTagIds.size === 0 && !datacatSearchQuery) {
             if (parsed.window === '24h') datacatFreshLimit24 += FRESH_PAGE_INCREMENT;
             else datacatFreshLimitWeek += FRESH_PAGE_INCREMENT;
         }
@@ -596,13 +596,11 @@ function filterDatacatCharacters(characters) {
         ? characters
         : characters.filter(c => !isNsfw(c));
 
-    if (datacatFilterHideOwned) {
-        filtered = filtered.filter(c => !isCharInLocalLibrary(c));
+    const activeRows = activeFeatureRows(DATACAT_FEATURE_FILTERS, datacatFeatureState);
+    if (activeRows.length) {
+        filtered = filtered.filter(c => featurePasses(c, activeRows));
     }
-    if (datacatFilterHidePossible) {
-        filtered = filtered.filter(c => !isCharPossibleMatchObj(c));
-    }
-    if (datacatFilterOnlyYours) {
+    if (datacatFeatureState.onlyYours) {
         // isDatacatYoursFilteredHit relies on the "saved" flags (isCollected etc.)
         // that fetchDatacatYoursCharacters forcibly stamps on every hit ('all').
         // fetchDatacatFolderCharacters (the 'main'/folder routes) proxies DataCat's
@@ -612,12 +610,6 @@ function filterDatacatCharacters(characters) {
         if (datacatYoursFolderSel === 'all') {
             filtered = filtered.filter(c => isDatacatYoursFilteredHit(c));
         }
-    }
-    if (datacatFilterHideJanitor) {
-        filtered = filtered.filter(c => getSourceKind(c) !== 'janitor');
-    }
-    if (datacatFilterHideSaucepan) {
-        filtered = filtered.filter(c => getSourceKind(c) !== 'saucepan');
     }
 
     // Client-side: persistent exclude tags from settings
@@ -747,7 +739,7 @@ async function loadCharacters(append = false) {
             list = data?.characters || [];
             total = data?.total || 0;
             hampterTotalPages = total > 0 ? Math.ceil(total / (data?.pageSize || 34)) : 0;
-        } else if (datacatFilterOnlyYours) {
+        } else if (datacatFeatureState.onlyYours) {
             const common = {
                 limit: PAGE_SIZE,
                 offset: datacatCurrentOffset,
@@ -795,7 +787,7 @@ async function loadCharacters(append = false) {
         if (!delegatesInitialized) return;
 
         const freshParsed = parseSortMode(datacatSortMode);
-        const isFreshMode = datacatBrowseMode !== 'creator' && !datacatFilterOnlyYours && freshParsed && datacatActiveTagIds.size === 0 && !datacatSearchQuery;
+        const isFreshMode = datacatBrowseMode !== 'creator' && !datacatFeatureState.onlyYours && freshParsed && datacatActiveTagIds.size === 0 && !datacatSearchQuery;
         const isMeili = isJannySortMode(datacatSortMode);
         const isHampter = isHampterSortMode(datacatSortMode);
 
@@ -861,9 +853,9 @@ async function loadCharacters(append = false) {
                 ? 'No characters found for this creator'
                 : 'No characters found';
             grid.innerHTML = `
-                <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted);">
-                    <i class="fa-solid fa-cat" style="font-size: 2rem; opacity: 0.5;"></i>
-                    <p style="margin-top: 12px;">${emptyMsg}</p>
+                <div class="browse-empty-state">
+                    <i class="fa-solid fa-cat browse-empty-icon"></i>
+                    <p class="u-mt-md">${emptyMsg}</p>
                 </div>
             `;
         }
@@ -925,13 +917,13 @@ async function loadCharacters(append = false) {
             if (isHampterLoginGated || isHampterTokenExpired) {
                 const expired = isHampterTokenExpired;
                 grid.innerHTML = `
-                    <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted); max-width: 560px; margin: 0 auto;">
-                        <i class="fa-solid fa-user-lock" style="font-size: 2rem; color: #f5a623;"></i>
-                        <p style="margin-top: 12px; color: var(--text-primary);"><strong>${expired ? 'Your JanitorAI session expired' : 'JanitorAI requires an account for this request'}</strong></p>
-                        <p style="margin-top: 8px;">${expired
+                    <div class="browse-empty-state is-narrow">
+                        <i class="fa-solid fa-user-lock browse-empty-icon is-warn"></i>
+                        <p class="browse-empty-lead"><strong>${expired ? 'Your JanitorAI session expired' : 'JanitorAI requires an account for this request'}</strong></p>
+                        <p class="u-mt-sm">${expired
                             ? 'JanitorAI tokens last about 3 hours. Re-copy the sb-auth-auth-token cookie and paste it under Settings &rarr; Online &rarr; DataCat Plus.'
                             : 'The Hampter sorts show the first page without a login. Paste your JanitorAI token under Settings &rarr; Online &rarr; DataCat Plus to browse further, or use the MeiliSearch sort orders, which need no login.'}</p>
-                        <button class="glass-btn" style="margin-top: 12px;" id="datacatRetryBtn">
+                        <button class="glass-btn u-mt-md" id="datacatRetryBtn">
                             <i class="fa-solid fa-redo"></i> Retry
                         </button>
                     </div>
@@ -939,11 +931,11 @@ async function loadCharacters(append = false) {
             } else if (isHampterBlocked) {
                 // CL-only: isJanitorBridgeAvailable() and openGalleryInfoModal('providers', 'helpDatacatHampter') removed, no Sigma equivalent
                 grid.innerHTML = `
-                    <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted); max-width: 560px; margin: 0 auto;">
-                        <i class="fa-solid fa-shield-halved" style="font-size: 2rem; color: #f5a623;"></i>
-                        <p style="margin-top: 12px; color: var(--text-primary);"><strong>Cloudflare blocked this request</strong></p>
-                        <p style="margin-top: 8px;">JanitorAI's Hampter sort orders sit behind Cloudflare, which blocked this load. The other JanitorAI sort orders (MeiliSearch) always work.</p>
-                        <button class="glass-btn" style="margin-top: 12px;" id="datacatRetryBtn">
+                    <div class="browse-empty-state is-narrow">
+                        <i class="fa-solid fa-shield-halved browse-empty-icon is-warn"></i>
+                        <p class="browse-empty-lead"><strong>Cloudflare blocked this request</strong></p>
+                        <p class="u-mt-sm">JanitorAI's Hampter sort orders sit behind Cloudflare, which blocked this load. The other JanitorAI sort orders (MeiliSearch) always work.</p>
+                        <button class="glass-btn u-mt-md" id="datacatRetryBtn">
                             <i class="fa-solid fa-redo"></i> Retry
                         </button>
                     </div>
@@ -1154,19 +1146,14 @@ function cycleTagState(btn, active) {
 
 function updateTagsButton() {
     const btn = document.getElementById('datacatTagsBtn');
-    const label = document.getElementById('datacatTagsBtnLabel');
     if (!btn) return;
 
-    const count = isJannyTagMode()
+    // Sigma's count badge (it also feeds the phone's overflow label); a Hampter sort sends no
+    // tags, so the greyed button counts none there
+    const count = isHampterSortMode(datacatSortMode) ? 0 : isJannyTagMode()
         ? jannyActiveTagIds.size
         : datacatActiveTagIds.size;
-    if (count > 0) {
-        btn.classList.add('has-filters');
-        if (label) label.innerHTML = `Tags <span class="tag-count">(${count})</span>`;
-    } else {
-        btn.classList.remove('has-filters');
-        if (label) label.textContent = 'Tags';
-    }
+    setFilterCount(btn, 'Tags', count);
 }
 
 // ========================================
@@ -1182,12 +1169,12 @@ function updateTagsVisibility() {
     if (!btn) return;
     // Hampter does have tag params (the janitorai provider sends them), but datacat's hampter
     // mode never wired a picker for them, so it stays hidden here.
-    const hide = isHampterSortMode(datacatSortMode);
-    btn.style.display = hide ? 'none' : '';
-    if (hide) {
-        const dropdown = document.getElementById('datacatTagsDropdown');
-        if (dropdown) dropdown.classList.add('hidden');
-    }
+    // Sigma greys an unavailable control and says why, rather than hiding it
+    const off = isHampterSortMode(datacatSortMode);
+    btn.disabled = off;
+    btn.classList.toggle('browse-option-disabled', off);
+    btn.title = off ? 'Not available with JanitorAI Hampter sorts' : 'Tag filters';
+    if (off) document.getElementById('datacatTagsDropdown')?.classList.add('hidden');
 }
 
 function updateSourceFilterVisibility() {
@@ -1697,7 +1684,7 @@ async function lookupExternalCharacter(charId, originalUrl, source = 'janitor') 
     const banner = document.getElementById('datacatCreatorBanner');
     if (banner) banner.classList.add('hidden');
     const loadMoreEl = document.getElementById('datacatLoadMore');
-    if (loadMoreEl) loadMoreEl.style.display = 'none';
+    if (loadMoreEl) loadMoreEl.hidden = true;
 
     try {
         const character = await fetchDatacatCharacter(charId, source);
@@ -2191,7 +2178,7 @@ async function followCreator(creatorId, creatorName, source = 'datacat') {
         const result = await setDatacatFollow(creatorId, true);
         if (!result?.ok) throw new Error(result?.error || 'DataCat sync failed');
         setFollowState(creatorId, source, result.following !== false);
-        showToast(`Followed ${creatorName || 'creator'} on DataCat`, 'success');
+        showToast(`Followed ${creatorName || 'creator'}`, 'success');
     } catch (err) {
         setFollowState(creatorId, source, false);
         localRemoveFollow(creatorId, source);
@@ -2205,7 +2192,7 @@ async function followCreator(creatorId, creatorName, source = 'datacat') {
 async function unfollowCreator(creatorId, source = 'datacat') {
     if (!isCreatorFollowed(creatorId, source) || datacatFollowSyncPending) return;
 
-    const name = localRemoveFollow(creatorId, source) || creatorId;
+    const name = localRemoveFollow(creatorId, source) || 'creator';
     setFollowState(creatorId, source, false);
     updateFollowButton(creatorId, source);
 
@@ -2219,7 +2206,7 @@ async function unfollowCreator(creatorId, source = 'datacat') {
         const result = await setDatacatFollow(creatorId, false);
         if (!result?.ok) throw new Error(result?.error || 'DataCat sync failed');
         setFollowState(creatorId, source, result.following === true);
-        showToast(`Unfollowed ${name} on DataCat`, 'info');
+        showToast(`Unfollowed ${name}`, 'info');
     } catch (err) {
         setFollowState(creatorId, source, true);
         localAddFollow(creatorId, name, source);
@@ -2546,20 +2533,12 @@ function renderFollowing(append = false) {
         ? source
         : source.filter(c => !isNsfw(c));
 
-    if (datacatFilterHideOwned) {
-        filtered = filtered.filter(c => !isCharInLocalLibrary(c));
+    const activeRows = activeFeatureRows(DATACAT_FEATURE_FILTERS, datacatFeatureState);
+    if (activeRows.length) {
+        filtered = filtered.filter(c => featurePasses(c, activeRows));
     }
-    if (datacatFilterHidePossible) {
-        filtered = filtered.filter(c => !isCharPossibleMatchObj(c));
-    }
-    if (datacatFilterOnlyYours) {
+    if (datacatFeatureState.onlyYours) {
         filtered = filtered.filter(c => isDatacatYoursFilteredHit(c));
-    }
-    if (datacatFilterHideJanitor) {
-        filtered = filtered.filter(c => getSourceKind(c) !== 'janitor');
-    }
-    if (datacatFilterHideSaucepan) {
-        filtered = filtered.filter(c => getSourceKind(c) !== 'saucepan');
     }
 
     const dcPersistentExclude = getProviderExcludeTags(PROVIDER_ID);
@@ -2631,7 +2610,7 @@ function openPreviewModal(hit) {
     const tags = resolveTagNames(hit.tags || []);
     const creatorName = getCreatorName(hit) || 'Unknown';
     const inLibrary = isCharInLocalLibrary(hit);
-    const possibleTier = inLibrary ? null : view.getPossibleMatchTier(hit.name || '', creatorName);
+    const possibleTier = inLibrary ? null : view.possibleMatchTierFor(hit);
     const possibleMatch = !!possibleTier?.show;
 
     const chatCount = getChatCount(hit);
@@ -2731,17 +2710,24 @@ function openPreviewModal(hit) {
     const importBtn = document.getElementById('datacatImportBtn');
     delete importBtn.dataset.extractId;
     delete importBtn.dataset.extractPhase;
+    datacatPreviewDetailReady = false;
     if (inLibrary) {
-        importBtn.innerHTML = '<i class="fa-solid fa-check"></i> In Library';
-        importBtn.classList.add('cl-btn-secondary');
-        importBtn.classList.remove('cl-btn-primary', 'cl-btn-warning');
-        importBtn.disabled = false;
+        view.stampImportButton(importBtn, { inLibrary: true });
     } else {
         importBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Loading...';
         importBtn.classList.remove('cl-btn-primary', 'cl-btn-secondary', 'cl-btn-warning');
         importBtn.classList.add('cl-btn-secondary');
         importBtn.disabled = true;
     }
+    // the button follows the library while the preview is open (an import elsewhere, a heal),
+    // as Sigma's providers do; before the detail lands only In Library may show
+    view.trackPreview(() => {
+        if (datacatSelectedChar !== hit) return;
+        const btn = document.getElementById('datacatImportBtn');
+        if (!btn || btn.dataset.extractId) return;
+        if (datacatPreviewDetailReady) view.stampPreviewImport(btn, hit);
+        else if (view.isHitInLibrary(hit)) view.stampImportButton(btn, { inLibrary: true });
+    }, hit);
 
     modal.classList.remove('hidden');
     const charBody = modal.querySelector('.browse-char-body');
@@ -3014,26 +3000,10 @@ async function fetchAndPopulateDetails(hit, token) {
 
         // Enable import button now that full character data is confirmed
         const importBtn = document.getElementById('datacatImportBtn');
+        // Sigma's own stamp: In Library by the hit's link, a possible match by the view's hitMatchName
         if (importBtn && !importBtn.dataset.extractId) {
-            const inLibrary = isCharInLocalLibrary(hit);
-            if (inLibrary) {
-                importBtn.innerHTML = '<i class="fa-solid fa-check"></i> In Library';
-                importBtn.classList.add('cl-btn-secondary');
-                importBtn.classList.remove('cl-btn-primary', 'cl-btn-warning');
-            } else {
-                const creatorName = character.creator_name || character.creatorName || hit.creator_name || '';
-                const possibleMatch = view.isCharPossibleMatch(name, creatorName);
-                if (possibleMatch) {
-                    importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import (Possible Match)';
-                    importBtn.classList.add('cl-btn-warning');
-                    importBtn.classList.remove('cl-btn-primary', 'cl-btn-secondary');
-                } else {
-                    importBtn.innerHTML = '<i class="fa-solid fa-download"></i> Import';
-                    importBtn.classList.add('cl-btn-primary');
-                    importBtn.classList.remove('cl-btn-secondary', 'cl-btn-warning');
-                }
-            }
-            importBtn.disabled = false;
+            datacatPreviewDetailReady = true;
+            view.stampPreviewImport(importBtn, hit);
         }
 
         // Fetch download data for alternate greetings and example messages
@@ -3379,7 +3349,7 @@ function updateNsfwToggle() {
 }
 
 function updateDatacatFiltersButtonState() {
-    const count = [datacatFilterHideOwned, datacatFilterHidePossible, datacatFilterOnlyYours, datacatFilterHideJanitor].filter(Boolean).length;
+    const count = countActiveFeatures(DATACAT_FEATURE_FILTERS, datacatFeatureState);
     // Sigma's count badge, like every native Features button (no relabelled button text)
     setFilterCount(document.getElementById('datacatFiltersBtn'), 'Features', count);
 }
@@ -3394,7 +3364,7 @@ function renderDatacatYoursFolderOptions() {
     select._customSelect?.refresh?.();
 }
 function updateDatacatYoursFolderBar() {
-    document.getElementById('datacatYoursFolderBar')?.classList.toggle('hidden', !datacatFilterOnlyYours);
+    document.getElementById('datacatYoursFolderBar')?.classList.toggle('hidden', !datacatFeatureState.onlyYours);
 }
 async function loadDatacatYoursFolders() {
     try {
@@ -3562,42 +3532,26 @@ function initDatacatView() {
         document.getElementById('datacatFiltersDropdown')?.classList.toggle('hidden');
     });
 
-    // Filter checkboxes
-    const dcFilterCheckboxes = [
-        { id: 'datacatFilterHideOwned', setter: (v) => datacatFilterHideOwned = v, getter: () => datacatFilterHideOwned },
-        { id: 'datacatFilterHidePossible', setter: (v) => datacatFilterHidePossible = v, getter: () => datacatFilterHidePossible },
-        { id: 'datacatFilterOnlyYours', setter: (v) => datacatFilterOnlyYours = v, getter: () => datacatFilterOnlyYours },
-        { id: 'datacatFilterHideJanitor', setter: (v) => datacatFilterHideJanitor = v, getter: () => datacatFilterHideJanitor },
-    ];
-    dcFilterCheckboxes.forEach(({ id, getter }) => {
-        const cb = document.getElementById(id);
-        if (cb) cb.checked = getter();
-    });
-    updateDatacatFiltersButtonState();
-
-    dcFilterCheckboxes.forEach(({ id, setter }) => {
-        document.getElementById(id)?.addEventListener('change', (e) => {
-            setter(e.target.checked);
-            updateDatacatFiltersButtonState();
-            if (id === 'datacatFilterOnlyYours') {
-                if (e.target.checked) void loadDatacatYoursFolders();
-                else {
-                    datacatYoursFolderSel = 'all';
-                    renderDatacatYoursFolderOptions();
-                }
-                updateDatacatYoursFolderBar();
+    // Feature rows: Sigma's wiring (it sets the checkbox, the state and the count badge)
+    datacatBrowseView.wireFeatureFilters(DATACAT_FEATURE_FILTERS, datacatFeatureState, (f) => {
+        if (f.key === 'onlyYours') {
+            if (datacatFeatureState.onlyYours) void loadDatacatYoursFolders();
+            else {
+                datacatYoursFolderSel = 'all';
+                renderDatacatYoursFolderOptions();
             }
-            if (datacatViewMode === 'following') renderFollowing();
-            else if (id === 'datacatFilterOnlyYours') {
-                resetDatacatYoursPagination();
-                loadCharacters(false);
-            } else renderGrid(datacatCharacters, false);
-        });
-    });
+            updateDatacatYoursFolderBar();
+        }
+        if (datacatViewMode === 'following') renderFollowing();
+        else if (f.key === 'onlyYours') {
+            resetDatacatYoursPagination();
+            loadCharacters(false);
+        } else renderGrid(datacatCharacters, false);
+    }, { badge: updateDatacatFiltersButtonState });
 
     on('datacatYoursFolderSelect', 'change', () => {
         const select = document.getElementById('datacatYoursFolderSelect');
-        if (!select || !datacatFilterOnlyYours) return;
+        if (!select || !datacatFeatureState.onlyYours) return;
         datacatYoursFolderSel = normalizeDatacatYoursFolderSelection(select.value, datacatYoursFoldersCache);
         resetDatacatYoursPagination();
         loadCharacters(false);
@@ -3834,7 +3788,7 @@ function ensureModalEventsAttached() {
         if (!charId) return;
         const hit = findDatacatHitOrSelected(charId);
         if (!isDatacatYoursSyncEnabled()) {
-            showToast('Sign in to DataCat in Settings to use folders', 'warning');
+            showToast('Log in to DataCat in Settings to use collections', 'info');
             return;
         }
         if (!canShowDatacatYoursControl(charId, hit)) {
@@ -4093,7 +4047,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             </div>
 
             <!-- Tags -->
-            <div class="browse-tags-dropdown-container" style="position: relative;">
+            <div class="browse-tags-dropdown-container u-relative">
                 <button id="datacatTagsBtn" class="glass-btn" title="Tag filters">
                     <i class="fa-solid fa-tags"></i> <span id="datacatTagsBtnLabel">Tags</span>
                 </button>
@@ -4109,12 +4063,12 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             </div>
 
             <!-- Filters -->
-            <div class="browse-more-filters" style="position: relative;">
+            <div class="browse-more-filters u-relative">
                 <button id="datacatFiltersBtn" class="glass-btn" title="Filter by character features">
                     <i class="fa-solid fa-sliders"></i> <span>Features</span>
                 </button>
                 <div id="datacatFiltersDropdown" class="dropdown-menu browse-features-dropdown hidden">
-                    ${renderFeatureFilterItems(DATACAT_FILTER_SECTIONS, DATACAT_FEATURE_ROWS)}
+                    ${renderFeatureFilterItems(DATACAT_FILTER_SECTIONS, DATACAT_FEATURE_FILTERS)}
                 </div>
             </div>
 
@@ -4179,7 +4133,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
 
                 <div id="datacatYoursFolderBar" class="datacat-yours-folder-bar hidden">
                     <span class="datacat-yours-folder-label"><i class="fa-solid fa-folder-open"></i> Your collections</span>
-                    <select id="datacatYoursFolderSelect" class="glass-select cl-select-fluid" title="Filter your collections by folder">
+                    <select id="datacatYoursFolderSelect" class="glass-select" title="Filter your collections by folder">
                         <option value="all">All characters</option>
                         <option value="main">Main</option>
                     </select>
@@ -4189,7 +4143,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                 <div id="datacatGrid" class="browse-grid"></div>
 
                 <!-- Load More -->
-                <div class="browse-load-more" id="datacatLoadMore" style="display: none;">
+                <div class="browse-load-more" id="datacatLoadMore" hidden>
                     <button id="datacatLoadMoreBtn" class="glass-btn">
                         <i class="fa-solid fa-plus"></i> Load More
                     </button>
@@ -4212,7 +4166,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                 </div>
                 ${this.renderFollowingManagerPanel()}
                 <div id="datacatFollowingGrid" class="browse-grid"></div>
-                <div class="browse-load-more" id="datacatFollowingLoadMore" style="display: none;">
+                <div class="browse-load-more" id="datacatFollowingLoadMore" hidden>
                     <button id="datacatFollowingLoadMoreBtn" class="glass-btn">
                         <i class="fa-solid fa-plus"></i> Load More
                     </button>
@@ -4234,14 +4188,14 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                         <h2 id="datacatCharName">Character Name</h2>
                         <p class="browse-char-meta">
                             by <a id="datacatCharCreator" href="#" class="creator-link browse-meta-identity" title="Click to browse this creator's characters">Creator</a>
-                            <span id="datacatFolderSep" class="browse-meta-sep" style="display:none"> • </span><button
+                            <span id="datacatFolderSep" hidden> • </span><button
                                 type="button"
                                 id="datacatFolderBtn"
-                                class="browse-meta-action browse-fav-toggle"
+                                class="datacat-favorite-btn-inline browse-fav-toggle"
                                 title="Add to collection"
                                 aria-label="Add to collection"
                                 aria-haspopup="dialog"
-                                style="display: none;"
+                                hidden
                             ><i class="fa-regular fa-heart"></i></button>
                         </p>
                     </div>
@@ -4407,10 +4361,10 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             if (!ok) {
                 const g = document.getElementById('datacatGrid');
                 if (g) g.innerHTML = `
-                    <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted);">
-                        <i class="fa-solid fa-plug-circle-xmark" style="font-size: 2rem; color: var(--cl-warning-bright-darker);"></i>
-                        <p style="margin-top: 12px;">The <strong>DataCat Plus</strong> server module is not responding.</p>
-                        <p style="margin-top: 8px; font-size: 0.85em;">Verify that DataCat Plus is enabled and the Sigma server is running.</p>
+                    <div class="browse-empty-state is-narrow">
+                        <i class="fa-solid fa-plug-circle-xmark browse-empty-icon is-warn"></i>
+                        <p class="browse-empty-lead">The <strong>DataCat Plus</strong> server module is not responding.</p>
+                        <p class="u-mt-sm">Verify that DataCat Plus is enabled and the Sigma server is running.</p>
                     </div>
                 `;
                 return;
@@ -4474,17 +4428,8 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                 if (el) el.value = defaults.sort;
             }
         }
-        if (defaults.hideOwned) {
-            datacatFilterHideOwned = true;
-            const el = document.getElementById('datacatFilterHideOwned');
-            if (el) el.checked = true;
-        }
-        if (defaults.hidePossible) {
-            datacatFilterHidePossible = true;
-            const el = document.getElementById('datacatFilterHidePossible');
-            if (el) el.checked = true;
-        }
-        if (defaults.hideOwned || defaults.hidePossible) updateDatacatFiltersButtonState();
+        // Sigma ticks the Library rows (state, checkbox, badge); the view and sort are handled above
+        super.applyDefaults({ hideOwned: defaults.hideOwned, hidePossible: defaults.hidePossible });
     }
 
     activate(container, options = {}) {

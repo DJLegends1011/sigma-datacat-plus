@@ -14,7 +14,7 @@ const folderPicker = await readFile(
 test('DataCat exposes one detail-only folder heart inline with creator', () => {
     assert.match(
         browse,
-        /<p class="browse-char-meta">[\s\S]{0,700}id="datacatFolderBtn"[\s\S]{0,250}browse-meta-action[\s\S]{0,250}title="Add to collection"[\s\S]{0,250}fa-regular fa-heart/,
+        /<p class="browse-char-meta">[\s\S]{0,700}id="datacatFolderBtn"[\s\S]{0,250}class="datacat-favorite-btn-inline browse-fav-toggle"[\s\S]{0,250}title="Add to collection"[\s\S]{0,250}fa-regular fa-heart/,
     );
     assert.doesNotMatch(browse, /id="datacatYoursBtn"/);
     assert.doesNotMatch(browse, /class="datacat-yours-btn/);
@@ -52,14 +52,19 @@ test('DataCat Features follows maintainer Personal and Library grouping', () => 
     // the rows are a table drawn by Sigma's renderFeatureFilterItems: Personal (Collected) comes before Library
     assert.match(browse, /\{ key: 'personal', title: 'Personal <span[^>]*>\(requires login\)<\/span>:' \},\s*\{ key: 'library', title: 'Library:' \}/);
     assert.match(browse, /\{ key: 'onlyYours', id: 'datacatFilterOnlyYours', section: 'personal', icon: 'fa-heart'[^}]*label: 'Collected' \}/);
-    assert.match(browse, /renderFeatureFilterItems\(DATACAT_FILTER_SECTIONS, DATACAT_FEATURE_ROWS\)/);
+    assert.match(browse, /renderFeatureFilterItems\(DATACAT_FILTER_SECTIONS, DATACAT_FEATURE_FILTERS\)/);
     assert.doesNotMatch(browse, /id="datacatFilterOnlyYours"[^>]*>[\s\S]{0,220}Only DataCat Yours<\/label>/);
 });
 
-// CL-only host files (../modules/providers/browse-shared.css and ../app/library-mobile.js)
-// do not exist in this extension repo and Sigma core does not define .browse-meta-action.
-test.skip('compact metadata actions have shared desktop and mobile treatment (CL host-only)', () => {});
-test.skip('mobile overflow omits hidden metadata actions (CL host-only)', () => {});
+// The heart is shaped like Sigma's own provider hearts (Chub, Botbooru): a site-scoped
+// *-favorite-btn-inline beside browse-fav-toggle, which Sigma's phone kebab menu reads. CL's
+// .browse-meta-action / .browse-meta-sep (CSS Sigma never had) must not come back.
+test('DataCat heart uses the native provider-heart shape, not CL\'s classes', async () => {
+    const css = await readFile(new URL('../client/datacat-browse.css', import.meta.url), 'utf8');
+    assert.match(css, /\.datacat-favorite-btn-inline\s*\{/);
+    assert.match(css, /\.datacat-favorite-btn-inline\.favorited/);
+    assert.doesNotMatch(browse + css, /browse-meta-action|browse-meta-sep/);
+});
 
 test('DataCat folder heart skips redundant DOM updates', () => {
     assert.match(browse, /const wasFav = btn\.classList\.contains\('favorited'\)/);

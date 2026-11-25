@@ -319,11 +319,12 @@ function wireRows(el, characterId, characterName) {
                         if (!result?.ok) throw new Error(result?.error || 'DataCat Main update failed');
                         el.dataset.collected = result.collected === true ? 'true' : 'false';
                         syncMainRowFromFolders(el, characterId);
+                        // removals are 'info', additions 'success', as Sigma's providers type them
                         showToast(
                             result.collected === true
                                 ? formatDatacatFolderSuccess('Main')
                                 : formatDatacatFolderRemoval('Main'),
-                            'success',
+                            result.collected === true ? 'success' : 'info',
                         );
                     }
                 } else {
@@ -343,7 +344,7 @@ function wireRows(el, characterId, characterName) {
                     const title = row.querySelector('.datacat-folder-row-title')?.textContent || 'folder';
                     showToast(
                         next ? formatDatacatFolderSuccess(title) : formatDatacatFolderRemoval(title),
-                        'success',
+                        next ? 'success' : 'info',
                     );
                 }
             } catch (err) {

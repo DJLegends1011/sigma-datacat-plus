@@ -18,8 +18,6 @@
         "datacatSyncYours": true,
         "datacatUseAccountForExtraction": true,
         "datacatFollowedCreators": [],
-        "datacatFollowMigrated": false,
-        "datacatJanitoraiToken": "",
-        "datacatJanitoraiRefreshToken": ""
+        "datacatFollowMigrated": false
     }
 }
