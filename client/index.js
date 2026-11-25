@@ -69,6 +69,7 @@ export default {
             _settingsAbort.abort();
             _settingsAbort = null;
         }
+        closeDatacatFolderPicker(); // also drops the phone-keyboard listeners
         closePreviewModal();
         clearCreatorFilter();
         disposeRestoreModal();
