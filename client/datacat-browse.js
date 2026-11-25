@@ -3360,8 +3360,8 @@ function renderDatacatYoursFolderOptions() {
     const select = document.getElementById('datacatYoursFolderSelect');
     if (!select) return;
     datacatYoursFolderSel = normalizeDatacatYoursFolderSelection(datacatYoursFolderSel, datacatYoursFoldersCache);
-    select.innerHTML = '<option value="all">All characters</option><option value="main">Main</option>'
-        + datacatYoursFoldersCache.map(folder => '<option value="' + escapeHtml(String(folder.id)) + '">' + escapeHtml(folder.title || 'Untitled folder') + '</option>').join('');
+    select.innerHTML = '<option value="all" data-icon="fa-solid fa-layer-group">All collections</option><option value="main" data-icon="fa-solid fa-star">Main</option>'
+        + datacatYoursFoldersCache.map(folder => '<option value="' + escapeHtml(String(folder.id)) + '" data-icon="fa-solid fa-folder">' + escapeHtml(folder.title || 'Untitled collection') + '</option>').join('');
     select.value = datacatYoursFolderSel;
     select._customSelect?.refresh?.();
 }
@@ -3550,6 +3550,13 @@ function initDatacatView() {
             loadCharacters(false);
         } else renderGrid(datacatCharacters, false);
     }, { badge: updateDatacatFiltersButtonState });
+
+    // the banner's x switches Collected off through its own Features checkbox, so the state, the count
+    // badge and the reload all take the one path
+    on('datacatYoursFolderClearBtn', 'click', () => {
+        const box = document.getElementById('datacatFilterOnlyYours');
+        if (box?.checked) box.click();
+    });
 
     on('datacatYoursFolderSelect', 'change', () => {
         const select = document.getElementById('datacatYoursFolderSelect');
@@ -3782,6 +3789,11 @@ function ensureModalEventsAttached() {
         getMainSaved: (id) => getDatacatYoursState(id, findDatacatHitOrSelected(id)),
         setMainSaved: (id, saved) => setDatacatMainMembership(id, saved, findDatacatHitOrSelected(id)),
         setAnyFolderSaved: (id, saved) => setDatacatFolderActionState(id, saved),
+        // a collection add that collected the character on the same trip
+        noteMainSaved: (id, saved) => {
+            setDatacatYoursState(id, saved === true);
+            refreshDatacatOnlyYoursFilterIfActive();
+        },
     });
 
     on('datacatFolderBtn', 'click', () => {
@@ -4133,12 +4145,21 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                     </div>
                 </div>
 
-                <div id="datacatYoursFolderBar" class="datacat-yours-folder-bar hidden">
-                    <span class="datacat-yours-folder-label"><i class="fa-solid fa-folder-open"></i> Your collections</span>
-                    <select id="datacatYoursFolderSelect" class="glass-select" title="Filter your collections by folder">
-                        <option value="all">All characters</option>
-                        <option value="main">Main</option>
-                    </select>
+                <!-- Collected banner: Sigma's filter banner, the same shape as the creator banner above -->
+                <div id="datacatYoursFolderBar" class="browse-author-banner hidden">
+                    <div class="browse-author-banner-content">
+                        <i class="fa-solid fa-heart"></i>
+                        <span>Browsing your <strong>Collected</strong> characters</span>
+                    </div>
+                    <div class="browse-author-banner-actions">
+                        <select id="datacatYoursFolderSelect" class="glass-select" title="Show one collection">
+                            <option value="all" data-icon="fa-solid fa-layer-group">All collections</option>
+                            <option value="main" data-icon="fa-solid fa-star">Main</option>
+                        </select>
+                        <button id="datacatYoursFolderClearBtn" class="glass-btn icon-only" title="Stop showing collected characters">
+                            <i class="fa-solid fa-times"></i>
+                        </button>
+                    </div>
                 </div>
 
                 <!-- Results Grid -->

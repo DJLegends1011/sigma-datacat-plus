@@ -184,6 +184,64 @@ test('account login persists per-user without leaking accountToken to client or 
     assert.deepEqual(statusBob.body, { valid: false, reason: 'no account token stored', user: null });
 });
 
+test('a collection add with ?collect=1 collects first, in one trip from the page (alice is signed in above)', async () => {
+    const aliceExt = alice.ext('datacat-plus');
+    const charId = '871f7a3c-16b7-4410-9ce1-a10125f610f0';
+    let collectStatus = 200;
+    let folderStatus = 200;
+    datacatResponder = (url, init) => {
+        if (url.endsWith('/api/auth/verify')) return jsonResp({ success: true, valid: true, user: { uuid: 'u-alice' } });
+        if (url.endsWith(`/api/characters/${charId}/collect`)) {
+            return collectStatus === 200 ? jsonResp({ success: true }) : jsonResp({ error: 'collect refused' }, collectStatus);
+        }
+        if (url.endsWith(`/api/user-folders/12/items/${charId}`)) {
+            return folderStatus === 200 ? jsonResp({ success: true }) : jsonResp({ error: 'folder refused' }, folderStatus);
+        }
+        return jsonResp({ error: 'unexpected ' + url }, 500);
+    };
+    const steps = () => upstreamCalls
+        .filter(c => /\/collect$|\/user-folders\//.test(c.url))
+        .map(c => `${c.method} ${c.url.replace('https://datacat.run', '')}`);
+
+    // collect, then the folder: DataCat refuses a folder for a character not collected yet
+    upstreamCalls.length = 0;
+    const both = await aliceExt(`/dc-folders/12/items/${charId}?collect=1`, 'PUT');
+    assert.equal(both.status, 200);
+    assert.equal(both.body.ok, true);
+    assert.equal(both.body.collected, true);
+    assert.deepEqual(steps(), [`POST /api/characters/${charId}/collect`, `PUT /api/user-folders/12/items/${charId}`]);
+
+    // without the flag only the folder is touched
+    upstreamCalls.length = 0;
+    const plain = await aliceExt(`/dc-folders/12/items/${charId}`, 'PUT');
+    assert.equal(plain.status, 200);
+    assert.equal('collected' in plain.body, false);
+    assert.deepEqual(steps(), [`PUT /api/user-folders/12/items/${charId}`]);
+
+    // a refused collect stops before the folder
+    upstreamCalls.length = 0;
+    collectStatus = 403;
+    const refused = await aliceExt(`/dc-folders/12/items/${charId}?collect=1`, 'PUT');
+    assert.equal(refused.status, 403);
+    assert.match(refused.body.error, /collect/i);
+    assert.deepEqual(steps(), [`POST /api/characters/${charId}/collect`]);
+
+    // the collect landed but the folder did not: the answer says so, so the page keeps Main ticked
+    upstreamCalls.length = 0;
+    collectStatus = 200;
+    folderStatus = 500;
+    const half = await aliceExt(`/dc-folders/12/items/${charId}?collect=1`, 'PUT');
+    assert.equal(half.status, 500);
+    assert.equal(half.body.collected, true);
+
+    // a removal never collects, even when asked to
+    upstreamCalls.length = 0;
+    folderStatus = 200;
+    const removal = await aliceExt(`/dc-folders/12/items/${charId}?collect=1`, 'DELETE');
+    assert.equal(removal.status, 200);
+    assert.deepEqual(steps(), [`DELETE /api/user-folders/12/items/${charId}`]);
+});
+
 test('/dc-proxy/*splat forwards allowed paths, passes 403 Turnstile through, blocks disallowed paths and off-origin redirects', async () => {
     const aliceExt = alice.ext('datacat-plus');
 

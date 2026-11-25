@@ -469,10 +469,16 @@ export async function reorderDatacatFolders(folderIds) {
     return { ok: true, folderIds: saved };
 }
 
-export async function setDatacatFolderMembership(folderId, characterId, member) {
+/**
+ * Add a character to (or take it out of) a collection.
+ * @param {{collect?: boolean}} [opts] collect: save it to the account first, in the same server trip
+ *   (DataCat refuses a collection for a character not collected yet); the answer then carries `collected`
+ */
+export async function setDatacatFolderMembership(folderId, characterId, member, { collect = false } = {}) {
     const path = buildDatacatFolderItemPath(folderId, characterId);
     if (!path) return { ok: false, error: 'Invalid DataCat folder or character id' };
-    return dcAccountJson(`${DC_EXT_BASE}${path}`, member ? 'PUT' : 'DELETE');
+    const query = member && collect ? '?collect=1' : '';
+    return dcAccountJson(`${DC_EXT_BASE}${path}${query}`, member ? 'PUT' : 'DELETE');
 }
 
 export async function fetchDatacatFolderCharacters(opts = {}) {

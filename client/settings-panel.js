@@ -44,7 +44,7 @@ export function settingsMarkup() {
         <div class="settings-row">
             <span class="settings-hint">Anonymous DataCat session, used for browsing public characters. It is kept on this Sigma server for your account and persists across sessions.</span>
         </div>
-        <div class="settings-row" style="gap: 8px;">
+        <div class="settings-row u-gap-sm">
             <button type="button" id="dcPlusRefreshTokenBtn" class="settings-action-btn"><i class="fa-solid fa-rotate"></i> New Token</button>
             <button type="button" id="dcPlusClearTokenBtn" class="settings-action-btn danger"><i class="fa-solid fa-trash-can"></i> Clear Session</button>
         </div>
@@ -60,17 +60,17 @@ export function settingsMarkup() {
         <div class="settings-row">
             <label>Email:</label>
             <div class="settings-input-group">
-                <input type="email" id="dcPlusAccountEmail" class="glass-input" placeholder="DataCat account email" autocomplete="email" spellcheck="false">
+                <input type="email" id="dcPlusAccountEmail" placeholder="DataCat account email" autocomplete="email" spellcheck="false">
             </div>
         </div>
         <div class="settings-row">
             <label>Password:</label>
             <div class="settings-input-group">
-                <input type="password" id="dcPlusAccountPassword" class="glass-input" placeholder="DataCat account password" autocomplete="current-password" data-sensitive="true">
+                <input type="password" id="dcPlusAccountPassword" placeholder="DataCat account password" autocomplete="current-password" data-sensitive="true">
                 ${eyeBtn('dcPlusToggleAccountPassword')}
             </div>
         </div>
-        <div class="settings-row" style="gap: var(--space-sm);">
+        <div class="settings-row u-gap-sm">
             <button type="button" id="dcPlusAccountLoginBtn" class="settings-action-btn primary" disabled><i class="fa-solid fa-right-to-bracket"></i> Sign In</button>
             <button type="button" id="dcPlusAccountLogoutBtn" class="settings-action-btn danger" style="display: none;"><i class="fa-solid fa-right-from-bracket"></i> Log Out</button>
         </div>
@@ -81,11 +81,11 @@ export function settingsMarkup() {
         <div class="settings-row" id="dcPlusTokenInputRow">
             <label>Token:</label>
             <div class="settings-input-group">
-                <input type="password" id="dcPlusAccountToken" class="glass-input" placeholder="Paste DataCat account token" autocomplete="off" data-sensitive="true">
+                <input type="password" id="dcPlusAccountToken" placeholder="Paste DataCat account token" autocomplete="off" data-sensitive="true">
                 ${eyeBtn('dcPlusToggleAccountToken')}
             </div>
         </div>
-        <div class="settings-row" style="gap: var(--space-sm);">
+        <div class="settings-row u-gap-sm">
             <button type="button" id="dcPlusAccountTokenConnectBtn" class="settings-action-btn primary"><i class="fa-solid fa-link"></i> Connect Token</button>
             <button type="button" id="dcPlusAccountOpenLoginBtn" class="settings-action-btn"><i class="fa-solid fa-up-right-from-square"></i> Open DataCat Login</button>
         </div>
@@ -94,14 +94,9 @@ export function settingsMarkup() {
     </div>
     <div class="settings-group">
         <div class="settings-group-title"><i class="fa-solid fa-folder-tree"></i> Collection Order</div>
-        <div class="settings-row">
-            <span class="settings-hint">Reorder how your DataCat collections appear here (collection picker and Collected filter). Changes are saved to your DataCat account, so the site and other devices follow the same order.</span>
-        </div>
-        <div class="settings-row">
-            <button type="button" id="dcPlusFolderOrderLoadBtn" class="settings-action-btn"><i class="fa-solid fa-rotate"></i> Load Folders</button>
-        </div>
-        <div id="dcPlusFolderOrderStatus" class="settings-row" style="display: none;"></div>
-        <div id="dcPlusFolderOrderList" class="settings-row datacat-folder-order-list"></div>
+        <p class="settings-hint u-mb-md">Drag to reorder your DataCat collections (the Add to Collection picker and the Collected filter follow it). The order is saved to your DataCat account, so the site and your other devices match.</p>
+        <p id="dcPlusFolderOrderStatus" class="settings-hint" hidden></p>
+        <div id="dcPlusFolderOrderList" class="provider-order-list"></div>
     </div>
     <div class="settings-group">
         <div class="settings-group-title"><i class="fa-solid fa-cloud-arrow-down"></i> Extraction</div>
@@ -122,11 +117,11 @@ export function settingsMarkup() {
         <div class="settings-row">
             <label>Cookie:</label>
             <div class="settings-input-group">
-                <input type="password" id="dcPlusJanitoraiToken" class="glass-input" placeholder="Paste the sb-auth-auth-token cookie value" autocomplete="off" spellcheck="false">
+                <input type="password" id="dcPlusJanitoraiToken" placeholder="Paste the sb-auth-auth-token cookie value" autocomplete="off" spellcheck="false">
                 ${eyeBtn('dcPlusToggleJanitoraiToken')}
             </div>
         </div>
-        <div class="settings-row" style="gap: var(--space-sm);">
+        <div class="settings-row u-gap-sm">
             <button type="button" id="dcPlusSaveJanitoraiTokenBtn" class="settings-action-btn primary"><i class="fa-solid fa-right-to-bracket"></i> Save Login</button>
             <button type="button" id="dcPlusClearJanitoraiTokenBtn" class="settings-action-btn danger"><i class="fa-solid fa-right-from-bracket"></i> Log Out</button>
         </div>
@@ -280,8 +275,10 @@ export function bindSettings(root, { settings, CoreAPI, signal }) {
             badge(accountStatus, true, `<i class="fa-solid fa-circle"></i> ${esc(label)}`);
             signedOutOnly.forEach(b => { if (b) b.style.display = 'none'; });
             if (logoutBtn) logoutBtn.style.display = '';
+            void loadOrderList(String(user?.id || user?.email || label));
             return;
         }
+        clearOrderList();
         badge(accountStatus, false, `<i class="fa-solid fa-circle"></i> ${result?.error ? 'Error' : 'Signed out'}`);
         signedOutOnly.forEach(b => { if (b) b.style.display = ''; });
         if (logoutBtn) logoutBtn.style.display = 'none';
@@ -357,75 +354,78 @@ export function bindSettings(root, { settings, CoreAPI, signal }) {
         renderAccountStatus({ valid: false });
     });
 
-    // ── collection order: DataCat owns displayOrder, so a move writes straight through,
-    // applied optimistically and rolled back if the account rejects it (CL behaviour) ──
-    const orderLoadBtn = $('dcPlusFolderOrderLoadBtn');
+    // ── collection order: Sigma's provider-order list and its drag reorder (CoreAPI.wireDragReorder,
+    // which drags from the grip on touch). DataCat owns displayOrder, so a drop writes straight
+    // through and the list rolls back if the account refuses it. It loads itself once signed in. ──
     const orderStatus = $('dcPlusFolderOrderStatus');
     const orderList = $('dcPlusFolderOrderList');
     let folders = [];
     let saving = false;
+    let orderLoadedFor = null;
 
     function showOrderStatus(message) {
         if (!orderStatus) return;
         orderStatus.textContent = message || '';
-        orderStatus.style.display = message ? '' : 'none';
+        orderStatus.hidden = !message;
     }
 
     function renderOrderList() {
         if (!orderList) return;
-        const last = folders.length - 1;
-        orderList.innerHTML = folders.map((f, i) => `
-            <div class="datacat-folder-order-row" data-folder-id="${esc(f.id)}">
-                <span class="datacat-folder-order-title">${esc(f.title)}</span>
-                <button type="button" data-move="-1" data-idx="${i}" ${i === 0 ? 'disabled' : ''} title="Move up"><i class="fa-solid fa-chevron-up"></i></button>
-                <button type="button" data-move="1" data-idx="${i}" ${i === last ? 'disabled' : ''} title="Move down"><i class="fa-solid fa-chevron-down"></i></button>
+        orderList.innerHTML = folders.map(f => `
+            <div class="provider-order-item" data-folder-id="${esc(f.id)}" draggable="true">
+                <i class="fa-solid fa-grip-vertical drag-handle"></i>
+                <i class="fa-solid fa-folder provider-order-icon"></i>
+                <span class="provider-order-name">${esc(f.title)}</span>
             </div>`).join('');
     }
 
-    on(orderList, 'click', async (e) => {
-        const btn = e.target.closest?.('button[data-move]');
-        if (!btn || saving) return;
-        const index = Number(btn.dataset.idx);
-        const target = index + Number(btn.dataset.move);
-        if (target < 0 || target >= folders.length) return;
+    async function saveDroppedOrder() {
+        const ids = [...orderList.querySelectorAll('.provider-order-item')].map(el => el.dataset.folderId);
         const previous = [...folders];
-        [folders[index], folders[target]] = [folders[target], folders[index]];
-        renderOrderList();
+        const byId = new Map(folders.map(f => [String(f.id), f]));
+        folders = ids.map(id => byId.get(String(id))).filter(Boolean);
+        if (saving || previous.every((f, i) => String(f.id) === String(folders[i]?.id))) return;
         saving = true;
-        showOrderStatus('Saving order to DataCat...');
+        orderList.setAttribute('aria-busy', 'true');
+        showOrderStatus('Saving the order to DataCat...');
         try {
             const res = await datacatReorderFolders(folders.map(f => f.id));
-            if (!res?.ok) throw new Error(res?.error || 'Could not save folder order');
+            if (!res?.ok) throw new Error(res?.error || 'Could not save the collection order');
             showOrderStatus(null);
         } catch (err) {
             folders = previous;
             renderOrderList();
-            showOrderStatus(err.message || 'Could not save folder order');
+            showOrderStatus(err.message || 'Could not save the collection order');
         } finally {
             saving = false;
+            orderList.removeAttribute('aria-busy');
         }
-    });
+    }
+    if (orderList) CoreAPI.wireDragReorder?.(orderList, { item: '.provider-order-item', handle: '.drag-handle', key: 'folderId', onReorder: saveDroppedOrder });
 
-    on(orderLoadBtn, 'click', async () => {
-        orderLoadBtn.disabled = true;
-        showOrderStatus('Loading folders...');
+    async function loadOrderList(accountKey) {
+        if (!orderList || orderLoadedFor === accountKey) return;
+        orderLoadedFor = accountKey;
+        showOrderStatus('Loading your collections...');
         try {
             const res = await datacatGetSettingsFolders();
-            if (!res?.ok) {
-                const errText = res?.error || 'Could not load folders';
-                showOrderStatus(/account|session|auth/i.test(errText) ? 'Sign in to DataCat first' : errText);
-                folders = [];
-            } else {
-                folders = Array.isArray(res.folders) ? res.folders : [];
-                showOrderStatus(folders.length ? null : 'No custom folders on this account.');
-            }
-            renderOrderList();
+            if (!res?.ok) throw new Error(res?.error || 'Could not load your collections');
+            folders = Array.isArray(res.folders) ? res.folders : [];
+            showOrderStatus(folders.length ? null : 'No collections on this account yet.');
         } catch (err) {
-            showOrderStatus(err.message || 'Could not load folders');
-        } finally {
-            orderLoadBtn.disabled = false;
+            orderLoadedFor = null; // the next status check tries again
+            folders = [];
+            showOrderStatus(err.message || 'Could not load your collections');
         }
-    });
+        renderOrderList();
+    }
+
+    function clearOrderList() {
+        orderLoadedFor = null;
+        folders = [];
+        renderOrderList();
+        showOrderStatus('Sign in to your DataCat account to reorder your collections.');
+    }
 
     // ── JanitorAI session (Hampter pagination) ──
     const jaiInput = $('dcPlusJanitoraiToken');

@@ -845,14 +845,33 @@ export function registerDataCatRoutes(router, ctx = null) {
         if (!isDataCatFolderId(folderId)) return res.status(400).json({ error: 'Invalid DataCat folder id' });
         if (!isDataCatCharacterId(characterId)) return res.status(400).json({ error: 'Invalid DataCat character id' });
 
+        // DataCat refuses a folder for a character not collected yet; ?collect=1 collects it first,
+        // so the page waits on one trip instead of two
+        const collectFirst = shouldAdd && String(req.query?.collect || '') === '1';
+        let collected = false;
         try {
+            if (collectFirst) {
+                const c = await fetchDcAccountEndpoint(
+                    account,
+                    `/api/characters/${encodeURIComponent(characterId)}/collect`,
+                    { method: 'POST', json: true },
+                );
+                if (!(c.response.ok && c.data?.success)) {
+                    return res.status(c.response.status || 502).json({
+                        error: formatDcError(c.response, c.data, c.rawText, 'DataCat collect'),
+                    });
+                }
+                collected = true;
+            }
             const path = `/api/user-folders/${encodeURIComponent(String(parseInt(folderId, 10)))}/items/${encodeURIComponent(characterId)}`;
             const { response, data, rawText } = await fetchDcAccountEndpoint(account, path, { method: shouldAdd ? 'PUT' : 'DELETE' });
             if (response.ok && data?.success) {
-                return res.json({ ...data, ok: true, folderId: parseInt(folderId, 10), characterId });
+                return res.json({ ...data, ok: true, folderId: parseInt(folderId, 10), characterId, ...(collectFirst ? { collected } : {}) });
             }
+            // the collect landed even though the folder step did not: say so, so the page keeps Main ticked
             return res.status(response.status || 502).json({
                 error: formatDcError(response, data, rawText, 'DataCat folder membership'),
+                ...(collected ? { collected: true } : {}),
             });
         } catch (err) {
             console.error('[datacat-plus] DC folder membership error:', err.message);
