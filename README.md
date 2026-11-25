@@ -44,7 +44,9 @@ Needs Σ with extension API 2.7 or newer.
 **Sends, and where:**
 - **To datacat.run:** everything you browse, search, extract, follow, collect or block, through the server half. When you sign in, your email and password go to DataCat's login once and are not saved anywhere; only the login DataCat hands back is kept.
 - **Your blocked tags,** when signed in, are saved to your DataCat account's block list (the one the site uses). Only the tags part of that list is changed. Signed out, they stay in this extension's settings. The blocked tags are also sent with each browse request so DataCat leaves those cards out.
-- **To JanitorAI (optional, only for Hampter's sorts):** if you paste your JanitorAI login cookie in settings, it's kept by the server half and only a short-lived pass is handed to the page, which talks to janitorai.com directly (it has to, because of JanitorAI's bot check). Renewing that login goes to JanitorAI's login service (supabase.co).
+- **JanitorAI search** goes through Σ's own JannyAI search (search.jannyai.com), straight from the page.
+- **To janitorai.com, from the page:** a JanitorAI card's public lorebook when you preview or import it, and the pages of Hampter's sorts.
+- **Your JanitorAI login (optional, only for Hampter's sorts):** if you paste your JanitorAI login cookie in settings, it's kept by the server half and only a short-lived pass is handed to the page, which talks to janitorai.com directly (it has to, because of JanitorAI's bot check). Renewing that login goes to JanitorAI's login service (supabase.co).
 - **Pictures** (character avatars) load straight from datacat.run, ella.janitorai.com or saucepan.ai, like any web image.
 - Nothing is sent anywhere else, and nothing is sent to the extension's author.
 
