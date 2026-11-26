@@ -4322,7 +4322,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
                         <p>New characters from creators you follow</p>
                     </div>
                     <div class="browse-timeline-header-right">
-                        <button class="follow-mgr-toggle-btn glass-btn" id="datacatFollowMgrToggle"
+                        <button class="follow-mgr-toggle-btn glass-btn" id="${this.provider.id}FollowMgrToggle"
                                 title="Manage followed creators">
                             <i class="fa-solid fa-users-gear"></i> Manage
                         </button>

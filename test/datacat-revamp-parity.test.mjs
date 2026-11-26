@@ -107,3 +107,9 @@ test('dispose closes the picker (and its keyboard listeners)', async () => {
 test('the picker header has no character name (it is always one card, the preview already shows it)', () => {
     assert.doesNotMatch(picker, /datacatFolderPickerCount|pl-picker-count/);
 });
+
+test('Following > Manage: the toggle id is the one Sigma wires (${provider.id}FollowMgrToggle), issue #1', () => {
+    // browse-view.js _initFollowingManager binds `${pid}FollowMgrToggle`; pid is 'datacat-plus'
+    assert.match(browse, /id="\$\{this\.provider\.id\}FollowMgrToggle"/);
+    assert.doesNotMatch(browse, /id="datacatFollowMgrToggle"/);
+});
